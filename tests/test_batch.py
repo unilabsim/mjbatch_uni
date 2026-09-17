@@ -666,6 +666,65 @@ def test_substep_sensor_copyout_validation(model):
     batch.step(substep_sensor_copyout=(0, 1))
 
 
+@pytest.mark.parametrize("ids", [None, np.array([1, 3])])
+def test_refresh_sensor_range_updates_only_selected_columns(ids):
+  model = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  batch = Batch(model, N, num_threads=2)
+  qpos, qvel, ctrl, sensordata, warmstart = (
+    batch.bind(f) for f in ("qpos", "qvel", "ctrl", "sensordata", "qacc_warmstart")
+  )
+  ctrl[:] = np.linspace(-0.2, 0.2, N)[:, None]
+  batch.step(nstep=3)
+  before = sensordata.copy()
+  qpos_before, qvel_before, warmstart_before = qpos.copy(), qvel.copy(), warmstart.copy()
+  selected = np.arange(N) if ids is None else ids
+
+  batch.refresh_sensor_range(ids, (0, 1))
+
+  np.testing.assert_array_equal(sensordata[selected, 0], qpos[selected, 1])
+  np.testing.assert_array_equal(sensordata[:, 1:], before[:, 1:])
+  np.testing.assert_array_equal(qpos, qpos_before)
+  np.testing.assert_array_equal(qvel, qvel_before)
+  np.testing.assert_array_equal(warmstart, warmstart_before)
+
+
+def test_refresh_sensor_ranges_updates_disjoint_columns():
+  model = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  batch = Batch(model, N, num_threads=2)
+  qpos, qvel, sensordata = (batch.bind(f) for f in ("qpos", "qvel", "sensordata"))
+  batch.step(nstep=2)
+  before = sensordata.copy()
+  selected = np.array([0, 2])
+
+  batch.refresh_sensor_ranges(selected, (0, 1, 4, 7))
+
+  np.testing.assert_array_equal(sensordata[selected, 0], qpos[selected, 1])
+  np.testing.assert_array_equal(sensordata[:, 1:4], before[:, 1:4])
+  np.testing.assert_array_equal(sensordata[[1, 3, 4, 5, 6, 7]], before[[1, 3, 4, 5, 6, 7]])
+  for row in selected:
+    reference = mujoco.MjData(model)
+    reference.qpos[:] = qpos[row]
+    reference.qvel[:] = qvel[row]
+    mujoco.mj_kinematics(model, reference)
+    mujoco.mj_comPos(model, reference)
+    mujoco.mj_comVel(model, reference)
+    mujoco.mj_sensorPos(model, reference)
+    mujoco.mj_sensorVel(model, reference)
+    np.testing.assert_array_equal(sensordata[row, 4:7], reference.sensordata[4:7])
+
+
+def test_refresh_sensor_range_validation(model):
+  batch = Batch(model, N)
+  with pytest.raises(ValueError, match=r"shape \(2,\)"):
+    batch.refresh_sensor_range(sensor_range=(0,))
+  with pytest.raises(ValueError, match="0 <= start < stop"):
+    batch.refresh_sensor_range(sensor_range=(2, 2))
+  with pytest.raises(ValueError, match="<= nsensordata"):
+    batch.refresh_sensor_range(sensor_range=(0, model.nsensordata + 1))
+  with pytest.raises(ValueError, match=r"\(start, stop\) pairs"):
+    batch.refresh_sensor_ranges(sensor_ranges=(0, 1, 2))
+
+
 def test_sleep_is_rejected():
   xml = LOCKSTEP_XML.replace("<option", '<option><flag sleep="enable"/></option><option')
   with pytest.raises(ValueError, match="sleep"):

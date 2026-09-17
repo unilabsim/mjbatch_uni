@@ -51,6 +51,18 @@ Acceleration-stage sensors and contact forces are not available before `mj_step2
 be stale in that view. The default callback path and all outputs are unchanged unless the
 optional range is passed.
 
+After a normal `step()` with `forward=False`, selected position- and velocity-stage sensor
+columns can be refreshed from the final integration state without a full `mj_forward`:
+
+```python
+batch.refresh_sensor_range(ids, (sensor_start, sensor_stop))
+```
+
+The refresh runs in native worker threads, copies only the requested columns into the bound
+`sensordata` view, and leaves acceleration-stage sensors (including contact forces) and all
+other bound fields unchanged. Disjoint ranges can be refreshed in one dispatch with
+`refresh_sensor_ranges(ids, (start0, stop0, start1, stop1, ...))`.
+
 ## Model randomization and variants
 
 `expand(field)` returns a live `(num_sims, ...)` view of a non-asset `MjModel` field.

@@ -318,6 +318,8 @@ struct QueryCtx {
   int npoint = 0;
   HfieldAlign align = HfieldAlign::World;  // SampleHfield: sampling grid rotation
   mjtNum* out = nullptr;      // (sel, npoint) rows
+  Slot* sensor = nullptr;     // RefreshSensor: bound sensordata slot
+  const std::vector<int>* sensor_ranges = nullptr;  // flattened (start, stop) pairs
 };
 
 // One substep of a callback-driven step (Op::Substep): the calling thread
@@ -416,6 +418,7 @@ class Batch {
     Substep2,  // split callback: apply writes and mj_step2
     Forward,
     Reset,
+    RefreshSensor,
     SetConst,
     JacSite,
     SampleHfield
@@ -520,6 +523,41 @@ class Batch {
   void forward(std::optional<Ids> ids) {
     ReentryGuard();
     Run(Op::Forward, Parse(ids), 0);
+  }
+
+  void RefreshSensorRanges(std::optional<Ids> ids, const std::vector<int>& sensor_ranges) {
+    ReentryGuard();
+    for (size_t i = 0; i < sensor_ranges.size(); i += 2) {
+      int start = sensor_ranges[i], stop = sensor_ranges[i + 1];
+      if (start < 0 || start >= stop || stop > template_->nsensordata) {
+        throw nb::value_error("sensor range entries must satisfy 0 <= start < stop <= nsensordata");
+      }
+    }
+    auto sel = Parse(ids);
+    Slot* sensor;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      sensor = &BoundOrAdd(Field(data_fields_, "sensordata"), false);
+    }
+    QueryCtx ctx;
+    ctx.sensor = sensor;
+    ctx.sensor_ranges = &sensor_ranges;
+    Run(Op::RefreshSensor, std::move(sel), 0, nullptr, &ctx);
+  }
+
+  void refresh_sensor_range(std::optional<Ids> ids, std::optional<std::vector<int>> sensor_range) {
+    if (!sensor_range || sensor_range->size() != 2) {
+      throw nb::value_error("sensor_range must have shape (2,)");
+    }
+    RefreshSensorRanges(std::move(ids), *sensor_range);
+  }
+
+  void refresh_sensor_ranges(std::optional<Ids> ids,
+                             std::optional<std::vector<int>> sensor_ranges) {
+    if (!sensor_ranges || sensor_ranges->empty() || sensor_ranges->size() % 2 != 0) {
+      throw nb::value_error("sensor_ranges must contain (start, stop) pairs");
+    }
+    RefreshSensorRanges(std::move(ids), *sensor_ranges);
   }
 
   void reset(std::optional<Ids> ids, int keyframe) {
@@ -908,6 +946,17 @@ class Batch {
       case Op::Reset:
         mj_forward(m, d);
         break;
+      case Op::RefreshSensor:
+        mj_kinematics(m, d);
+        mj_comPos(m, d);
+        mj_comVel(m, d);
+        mj_sensorPos(m, d);
+        mj_sensorVel(m, d);
+        for (int j = 0; j < static_cast<int>(ctx->sensor_ranges->size()); j += 2) {
+          CopySensorRange(*ctx->sensor, d, i, (*ctx->sensor_ranges)[j],
+                          (*ctx->sensor_ranges)[j + 1] - (*ctx->sensor_ranges)[j]);
+        }
+        return;
       // The query ops run kinematics only: they do not change the integration
       // state, so the copy-out tail below is skipped. mjData is shared by every
       // sim a worker serves, and copying out would leak another sim's stale

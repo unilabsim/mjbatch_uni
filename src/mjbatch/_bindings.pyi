@@ -79,6 +79,16 @@ class Batch:
         """
 
     def forward(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...
+    def refresh_sensor_range(
+        self,
+        ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = ...,
+        sensor_range: Sequence[int] = ...,
+    ) -> None: ...
+    def refresh_sensor_ranges(
+        self,
+        ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = ...,
+        sensor_ranges: Sequence[int] = ...,
+    ) -> None: ...
 
     def reset(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, keyframe: int = -1) -> None:
         """
