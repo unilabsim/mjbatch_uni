@@ -43,7 +43,12 @@ else()
 endif()
 
 nanobind_add_module(_bindings FREE_THREADED NOMINSIZE src/mjbatch/csrc/bindings.cpp)
-target_include_directories(_bindings PRIVATE "${MUJOCO_PKG_DIR}/include")
+if(WIN32)
+  # Windows headers are nested one directory deeper than the Unix wheels.
+  target_include_directories(_bindings PRIVATE "${MUJOCO_PKG_DIR}/include/mujoco")
+else()
+  target_include_directories(_bindings PRIVATE "${MUJOCO_PKG_DIR}/include")
+endif()
 target_link_libraries(_bindings PRIVATE "${MUJOCO_LIBRARY}")
 
 # Find libmujoco next to the installed extension, <site-packages>/mujoco. The
