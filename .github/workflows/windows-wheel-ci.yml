@@ -14,7 +14,7 @@ jobs:
     runs-on: windows-2025
     env:
       CIBW_BUILD: "cp310-win_amd64"
-      CIBW_TEST_COMMAND: "C:/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe -o -g -G -c \".symfix; .reload; sxe -c \\\"!analyze -gg; kVn 40; q\\\" av; g\" python -m pytest -q {project}/tests"
+      CIBW_TEST_COMMAND: '"C:/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe" -o -g -G -c ".symfix; .reload; sxe av; g; kVn 40; q" python -m pytest -q {project}/tests'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084 # v3.4.1
