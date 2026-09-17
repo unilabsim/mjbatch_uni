@@ -20,7 +20,6 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
-  "Operating System :: Microsoft :: Windows",
   "Programming Language :: C++",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
@@ -80,7 +79,9 @@ testpaths = ["tests"]
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-*"
-skip = "*-musllinux_* *_i686"
+# Windows: the mujoco wheel ships mujoco.dll with no import library, and the
+# extension finds libmujoco by rpath, which Windows has no equivalent of.
+skip = "*-musllinux_* *-win* *_i686"
 test-requires = "pytest"
 test-command = "pytest {project}/tests"
 
