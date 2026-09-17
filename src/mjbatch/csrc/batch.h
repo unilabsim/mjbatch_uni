@@ -1023,12 +1023,13 @@ class Batch {
     return out;
   }
 
-  // Keep setjmp in this frame on MSVC. Inlining it through a caller with
-  // non-trivial cleanup makes the later longjmp recover an invalid frame.
+  // Keep the setjmp frame separate from the worker lambda. Returning a status
+  // also prevents MSVC from turning either call below into a tail call, which
+  // would discard the caller frame that longjmp must return through.
 #if defined(_MSC_VER)
   __declspec(noinline)
 #endif
-  void Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
+  bool Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
                const CallbackCtx* cctx) {
     mjfLogHandler previous = _mjPRIVATE_setTlsLogHandler(LogTrap);
     tls_prev_handler = previous;
@@ -1045,11 +1046,12 @@ class Batch {
       mj_resetData(template_, data_[t]);
       std::lock_guard<std::mutex> lock(changed_mu_);
       if (error_.empty()) error_ = "sim " + std::to_string(i) + ": " + tls_error;
-      return;
+      return false;
     }
     tls_jmp_active = false;
     _mjPRIVATE_setTlsLogHandler(previous);
     tls_prev_handler = nullptr;
+    return true;
   }
 
   void Run(Op op, std::optional<std::vector<int>> sel, int arg, mjtNum* hist = nullptr,
@@ -1115,8 +1117,10 @@ class Batch {
         if (row_ctx.out) row_ctx.out += static_cast<size_t>(j) * row_ctx.npoint;
         c = &row_ctx;
       }
-      Guarded(t, p ? p[j] : j, op, arg,
-              hist ? hist + static_cast<size_t>(j) * arg * nstate_ : nullptr, c, nullptr);
+      if (!Guarded(t, p ? p[j] : j, op, arg,
+                   hist ? hist + static_cast<size_t>(j) * arg * nstate_ : nullptr, c, nullptr)) {
+        return;
+      }
     };
     if (pool_->size() == 1) {
       for (int j = 0; j < n; ++j) fn(0, j);
@@ -1141,7 +1145,7 @@ class Batch {
       CallbackCtx row = base;
       if (hist) row.hist = hist + static_cast<size_t>(j) * nstep * nstate_;
       row.done = done + j;
-      Guarded(t, p ? p[j] : j, op, k, nullptr, nullptr, &row);
+      if (!Guarded(t, p ? p[j] : j, op, k, nullptr, nullptr, &row)) return;
     };
     if (pool_->size() == 1) {
       for (int j = 0; j < n; ++j) fn(0, j);
