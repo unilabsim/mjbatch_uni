@@ -13,6 +13,7 @@ using namespace nb::literals;
 NB_MODULE(_bindings, m) {
   // Bound arrays keep their Batch alive by design, often until exit.
   nb::set_leak_warnings(false);
+  InstallLogTrap();
   if (mj_version() != mjVERSION_HEADER) {
     throw std::runtime_error("mjbatch was built against MuJoCo " +
                              std::to_string(mjVERSION_HEADER) + " but " +
@@ -59,9 +60,8 @@ changed, so derived constants are per simulation too; mjModel scalars it writes
 Derived constants follow expanded inputs only after set_const, as with
 mj_setConst on one model. A MuJoCo error on a worker raises RuntimeError naming
 the first failing simulation; the others still ran, and the failing one keeps the
-state it had before the call, its writes still pending. Errors are trapped with a
-thread-local MuJoCo handler scoped to each worker call, so process-global handlers
-remain available to the application.)")
+state it had before the call, its writes still pending. The trap is a MuJoCo log
+handler installed at import; installing another handler later disables it.)")
       .def(nb::init<nb::object, int, int, bool, std::optional<std::vector<int>>>(), "model"_a,
            "num_sims"_a, "num_threads"_a = 0, "forward"_a = false, "cpu_ids"_a = nb::none(),
            "num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends "
