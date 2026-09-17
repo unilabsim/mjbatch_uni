@@ -17,5 +17,8 @@ jobs:
       CIBW_TEST_COMMAND: "pytest -s {project}/tests"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: |
+          Get-Command cdb -ErrorAction SilentlyContinue
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue
       - uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084 # v3.4.1
       - run: Get-ChildItem wheelhouse
