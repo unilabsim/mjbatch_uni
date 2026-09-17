@@ -1023,6 +1023,8 @@ class Batch {
     return out;
   }
 
+  // Keep setjmp in this frame on MSVC. Inlining it through a caller with
+  // non-trivial cleanup makes the later longjmp recover an invalid frame.
 #if defined(_MSC_VER)
   __declspec(noinline)
 #endif

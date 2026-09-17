@@ -20,6 +20,7 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: C++",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
