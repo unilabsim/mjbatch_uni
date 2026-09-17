@@ -394,7 +394,8 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
 // MuJoCo error handlers must not return. A thread-local handler and longjmp
 // keep the unwind within the worker's C++ frame, matching the official Python
 // bindings, without changing handlers owned by other threads.
-inline thread_local std::jmp_buf* tls_jmp = nullptr;
+inline thread_local std::jmp_buf tls_jmp_buf = {};
+inline thread_local bool tls_jmp_active = false;
 inline thread_local char tls_error[1024] = {};
 inline thread_local mjfLogHandler tls_prev_handler = nullptr;
 
@@ -405,14 +406,9 @@ extern "C" mjfLogHandler _mjPRIVATE_setTlsLogHandler(mjfLogHandler handler);
 extern "C" mjfLogHandler _mjPRIVATE_getGlobalLogHandler(void);
 
 inline void LogTrap(const mjLogMessage* msg) {
-  if (msg->level == mjLOG_ERROR && tls_jmp) {
-#ifdef _WIN32
-    std::fprintf(stderr, "MJDIAG handler tls=%p jmp=%p first=%016llx\n", &tls_jmp,
-                 tls_jmp, tls_jmp ? *reinterpret_cast<unsigned long long*>(tls_jmp) : 0ULL);
-    std::fflush(stderr);
-#endif
+  if (msg->level == mjLOG_ERROR && tls_jmp_active) {
     std::snprintf(tls_error, sizeof(tls_error), "%s", msg->subject);
-    std::longjmp(*tls_jmp, 1);
+    std::longjmp(tls_jmp_buf, 1);
   }
   // MuJoCo dispatches to this TLS handler instead of the global one. Preserve
   // an existing TLS handler when present; otherwise keep official bindings'
@@ -1029,42 +1025,24 @@ class Batch {
 
   void Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
                const CallbackCtx* cctx) {
-    std::jmp_buf jmp;
     mjfLogHandler previous = _mjPRIVATE_setTlsLogHandler(LogTrap);
     tls_prev_handler = previous;
-    tls_jmp = &jmp;
-#ifdef _WIN32
-    std::fprintf(stderr, "MJDIAG set frame=%p first=%016llx\n", tls_jmp,
-                 *reinterpret_cast<unsigned long long*>(tls_jmp));
-    std::fflush(stderr);
-#endif
-    if (setjmp(jmp) == 0) {
+    tls_jmp_active = true;
+    if (setjmp(tls_jmp_buf) == 0) {
       RunSim(t, i, op, arg, hist, ctx, cctx);
     } else {
-#ifdef _WIN32
-      std::fprintf(stderr, "MJDIAG catch sim %d\n", i);
-      std::fflush(stderr);
-#endif
-      tls_jmp = nullptr;
+      tls_jmp_active = false;
       _mjPRIVATE_setTlsLogHandler(previous);
       tls_prev_handler = nullptr;
       // The sim's state was not written back; the worker's mjData, left
       // mid-call with its stack and arena in use, serves other sims next.
       if (op == Op::SetConst) Restore(models_[t]);
-#ifdef _WIN32
-      std::fprintf(stderr, "MJDIAG before reset sim %d\n", i);
-      std::fflush(stderr);
-#endif
       mj_resetData(template_, data_[t]);
-#ifdef _WIN32
-      std::fprintf(stderr, "MJDIAG after reset sim %d\n", i);
-      std::fflush(stderr);
-#endif
       std::lock_guard<std::mutex> lock(changed_mu_);
       if (error_.empty()) error_ = "sim " + std::to_string(i) + ": " + tls_error;
       return;
     }
-    tls_jmp = nullptr;
+    tls_jmp_active = false;
     _mjPRIVATE_setTlsLogHandler(previous);
     tls_prev_handler = nullptr;
   }
@@ -1076,10 +1054,6 @@ class Batch {
     error_.clear();
     RunLocked(op, sel, arg, hist, ctx);
     if (!error_.empty()) {
-#ifdef _WIN32
-      std::fprintf(stderr, "MJDIAG run error\n");
-      std::fflush(stderr);
-#endif
       throw std::runtime_error(error_);
     }
   }
