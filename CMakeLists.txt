@@ -24,7 +24,8 @@ if(WIN32)
 
   # The MuJoCo wheel exports the C API from mujoco.dll but does not ship an
   # MSVC import library. Generate one at build time; it is not installed.
-  find_program(MSVC_LIB_EXECUTABLE NAMES lib)
+  get_filename_component(MSVC_TOOL_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  find_program(MSVC_LIB_EXECUTABLE NAMES lib HINTS "${MSVC_TOOL_BIN_DIR}")
   if(NOT MSVC_LIB_EXECUTABLE)
     message(FATAL_ERROR "Could not find MSVC lib.exe")
   endif()
