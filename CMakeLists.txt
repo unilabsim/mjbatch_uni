@@ -29,9 +29,32 @@ if(WIN32)
   if(NOT MSVC_LIB_EXECUTABLE)
     message(FATAL_ERROR "Could not find MSVC lib.exe")
   endif()
+  find_program(MSVC_DUMPBIN_EXECUTABLE NAMES dumpbin HINTS "${MSVC_TOOL_BIN_DIR}")
+  if(NOT MSVC_DUMPBIN_EXECUTABLE)
+    message(FATAL_ERROR "Could not find MSVC dumpbin.exe")
+  endif()
+
+  execute_process(
+    COMMAND "${MSVC_DUMPBIN_EXECUTABLE}" "/EXPORTS" "${MUJOCO_DLL}"
+    OUTPUT_VARIABLE MUJOCO_EXPORTS
+    COMMAND_ERROR_IS_FATAL ANY)
+  string(REGEX MATCHALL
+         " +[0-9]+ +[0-9A-Fa-f]+ +[0-9A-Fa-f]+ +([^ \r\n]+)"
+         MUJOCO_EXPORT_MATCHES "${MUJOCO_EXPORTS}")
+  if(NOT MUJOCO_EXPORT_MATCHES)
+    message(FATAL_ERROR "Could not parse exports from ${MUJOCO_DLL}")
+  endif()
+
+  set(MUJOCO_DEF_FILE "${CMAKE_CURRENT_BINARY_DIR}/mujoco.def")
+  file(WRITE "${MUJOCO_DEF_FILE}" "LIBRARY mujoco.dll\nEXPORTS\n")
+  foreach(export_match IN LISTS MUJOCO_EXPORT_MATCHES)
+    string(REGEX REPLACE ".* +([^ \r\n]+)$" "\\1" export_symbol "${export_match}")
+    file(APPEND "${MUJOCO_DEF_FILE}" "  ${export_symbol}\n")
+  endforeach()
+
   set(MUJOCO_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/mujoco.lib")
   execute_process(
-    COMMAND "${MSVC_LIB_EXECUTABLE}" "/def:${MUJOCO_DLL}" "/machine:x64"
+    COMMAND "${MSVC_LIB_EXECUTABLE}" "/def:${MUJOCO_DEF_FILE}" "/machine:x64"
             "/out:${MUJOCO_LIBRARY}"
     COMMAND_ERROR_IS_FATAL ANY)
 else()
