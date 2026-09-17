@@ -407,7 +407,8 @@ extern "C" mjfLogHandler _mjPRIVATE_getGlobalLogHandler(void);
 inline void LogTrap(const mjLogMessage* msg) {
   if (msg->level == mjLOG_ERROR && tls_jmp) {
 #ifdef _WIN32
-    std::fprintf(stderr, "MJDIAG handler\n");
+    std::fprintf(stderr, "MJDIAG handler tls=%p jmp=%p first=%016llx\n", &tls_jmp,
+                 tls_jmp, tls_jmp ? *reinterpret_cast<unsigned long long*>(tls_jmp) : 0ULL);
     std::fflush(stderr);
 #endif
     std::snprintf(tls_error, sizeof(tls_error), "%s", msg->subject);
@@ -1032,6 +1033,11 @@ class Batch {
     mjfLogHandler previous = _mjPRIVATE_setTlsLogHandler(LogTrap);
     tls_prev_handler = previous;
     tls_jmp = &jmp;
+#ifdef _WIN32
+    std::fprintf(stderr, "MJDIAG set frame=%p first=%016llx\n", tls_jmp,
+                 *reinterpret_cast<unsigned long long*>(tls_jmp));
+    std::fflush(stderr);
+#endif
     if (setjmp(jmp) == 0) {
       RunSim(t, i, op, arg, hist, ctx, cctx);
     } else {
