@@ -14,6 +14,7 @@ jobs:
     runs-on: windows-2025
     env:
       CIBW_BUILD: "cp310-win_amd64 cp311-win_amd64 cp312-win_amd64 cp313-win_amd64"
+      CIBW_TEST_COMMAND: "pytest -s {project}/tests"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084 # v3.4.1

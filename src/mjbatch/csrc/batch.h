@@ -406,6 +406,10 @@ extern "C" mjfLogHandler _mjPRIVATE_getGlobalLogHandler(void);
 
 inline void LogTrap(const mjLogMessage* msg) {
   if (msg->level == mjLOG_ERROR && tls_jmp) {
+#ifdef _WIN32
+    std::fprintf(stderr, "MJDIAG handler\n");
+    std::fflush(stderr);
+#endif
     std::snprintf(tls_error, sizeof(tls_error), "%s", msg->subject);
     std::longjmp(*tls_jmp, 1);
   }
@@ -1031,13 +1035,25 @@ class Batch {
     if (setjmp(jmp) == 0) {
       RunSim(t, i, op, arg, hist, ctx, cctx);
     } else {
+#ifdef _WIN32
+      std::fprintf(stderr, "MJDIAG catch sim %d\n", i);
+      std::fflush(stderr);
+#endif
       tls_jmp = nullptr;
       _mjPRIVATE_setTlsLogHandler(previous);
       tls_prev_handler = nullptr;
       // The sim's state was not written back; the worker's mjData, left
       // mid-call with its stack and arena in use, serves other sims next.
       if (op == Op::SetConst) Restore(models_[t]);
+#ifdef _WIN32
+      std::fprintf(stderr, "MJDIAG before reset sim %d\n", i);
+      std::fflush(stderr);
+#endif
       mj_resetData(template_, data_[t]);
+#ifdef _WIN32
+      std::fprintf(stderr, "MJDIAG after reset sim %d\n", i);
+      std::fflush(stderr);
+#endif
       std::lock_guard<std::mutex> lock(changed_mu_);
       if (error_.empty()) error_ = "sim " + std::to_string(i) + ": " + tls_error;
       return;
@@ -1054,6 +1070,10 @@ class Batch {
     error_.clear();
     RunLocked(op, sel, arg, hist, ctx);
     if (!error_.empty()) {
+#ifdef _WIN32
+      std::fprintf(stderr, "MJDIAG run error\n");
+      std::fflush(stderr);
+#endif
       throw std::runtime_error(error_);
     }
   }
