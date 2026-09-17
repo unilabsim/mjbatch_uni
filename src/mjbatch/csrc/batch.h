@@ -420,6 +420,41 @@ inline void LogTrap(const mjLogMessage* msg) {
   }
 }
 
+// A fatal MuJoCo callback cannot safely throw or return through C. Jump only
+// back to this tight wrapper, then throw from C++ after the C frames are gone.
+struct MjError : std::exception {
+  const char* what() const noexcept override { return tls_error; }
+};
+
+template <typename Return, typename... Args, typename... CallArgs>
+#if defined(_MSC_VER)
+__forceinline
+#endif
+Return TrapCall(Return (*fn)(Args...), CallArgs&&... args) {
+  mjfLogHandler previous = _mjPRIVATE_setTlsLogHandler(LogTrap);
+  tls_prev_handler = previous;
+  tls_jmp_active = true;
+  if (setjmp(tls_jmp_buf) == 0) {
+    if constexpr (std::is_void_v<Return>) {
+      fn(std::forward<CallArgs>(args)...);
+    } else {
+      Return result = fn(std::forward<CallArgs>(args)...);
+      tls_jmp_active = false;
+      _mjPRIVATE_setTlsLogHandler(previous);
+      tls_prev_handler = nullptr;
+      return result;
+    }
+    tls_jmp_active = false;
+    _mjPRIVATE_setTlsLogHandler(previous);
+    tls_prev_handler = nullptr;
+    return;
+  }
+  tls_jmp_active = false;
+  _mjPRIVATE_setTlsLogHandler(previous);
+  tls_prev_handler = nullptr;
+  throw MjError{};
+}
+
 // The Batch whose step callback is running on this thread: a reentrant call
 // from inside it raises instead of deadlocking on mu_.
 class Batch;
@@ -857,7 +892,7 @@ class Batch {
     if (op == Op::SetConst) Restore(m);
     for (auto& s : expanded_) FromBuf(s->info->get(m), s->buf.get() + i * s->row, *s);
     if (op == Op::SetConst) {
-      mj_setConst(m, d);
+      TrapCall(mj_setConst, m, d);
       for (auto& s : expanded_) ToBuf(s->buf.get() + i * s->row, s->info->get(m), *s);
       scalars_[i] = Scalars::Of(m);
       for (const FieldInfo* f : restorable_) {
@@ -872,12 +907,12 @@ class Batch {
     if (!models_.empty()) scalars_[i].Apply(m);
     if (op == Op::Reset) {
       if (arg >= 0) {
-        mj_resetDataKeyframe(m, d, arg);
+        TrapCall(mj_resetDataKeyframe, m, d, arg);
       } else {
-        mj_resetData(m, d);
+        TrapCall(mj_resetData, m, d);
       }
     } else {
-      mj_setState(m, d, State(i), mjSTATE_INTEGRATION);
+      TrapCall(mj_setState, m, d, State(i), mjSTATE_INTEGRATION);
       std::memcpy(d->warning, Warning(i), sizeof(d->warning));
     }
     for (auto& s : bound_) {
@@ -890,12 +925,13 @@ class Batch {
     switch (op) {
       case Op::Step: {
         for (int k = 0; k < arg; ++k) {
-          mj_step(m, d);
+          TrapCall(mj_step, m, d);
           if (hist) {
-            mj_getState(m, d, hist + static_cast<size_t>(k) * nstate_, mjSTATE_INTEGRATION);
+            TrapCall(mj_getState, m, d, hist + static_cast<size_t>(k) * nstate_,
+                     mjSTATE_INTEGRATION);
           }
         }
-        if (forward_) mj_forward(m, d);  // derived fields current with the new state
+        if (forward_) TrapCall(mj_forward, m, d);  // derived fields current with new state
         break;
       }
       case Op::Substep: {
@@ -909,12 +945,12 @@ class Batch {
         }
         bool tail = cctx->tail_only;
         if (!cctx->tail_only) {
-          mj_step(m, d);
+          TrapCall(mj_step, m, d);
           if (cctx->hist) {
-            mj_getState(m, d, cctx->hist + static_cast<size_t>(cctx->k) * nstate_,
-                        mjSTATE_INTEGRATION);
+            TrapCall(mj_getState, m, d,
+                     cctx->hist + static_cast<size_t>(cctx->k) * nstate_, mjSTATE_INTEGRATION);
           }
-          mj_getState(m, d, State(i), mjSTATE_INTEGRATION);
+          TrapCall(mj_getState, m, d, State(i), mjSTATE_INTEGRATION);
           std::memcpy(Warning(i), d->warning, sizeof(d->warning));
           if (cctx->k + 1 == cctx->nstep) tail = true;
         }
@@ -922,7 +958,7 @@ class Batch {
         cctx->done[0] = 1;
         // A tail after an exception always forwards, so derived fields are current
         // with the state the sim stopped at rather than one substep behind.
-        if (forward_ || cctx->tail_only) mj_forward(m, d);
+        if (forward_ || cctx->tail_only) TrapCall(mj_forward, m, d);
         if (cctx->tail_only) std::memcpy(Warning(i), d->warning, sizeof(d->warning));
         for (auto& s : bound_) CopyOut(*s, d, i);
         return;
@@ -930,7 +966,7 @@ class Batch {
       case Op::Substep1: {
         // Position- and velocity-stage sensors are current with State(i) here.
         // Input mirrors stay stale because Substep2 applies the callback writes.
-        mj_step1(m, d);
+        TrapCall(mj_step1, m, d);
         CopySensorRange(*cctx->sensor, d, i, cctx->sensor_start, cctx->sensor_width);
         return;
       }
@@ -939,35 +975,35 @@ class Batch {
         // per-sim snapshot. Stage one is recomputed after State(i) and the
         // callback writes have been loaded; the sensor view copied above is
         // still the fresh result at x_k. Sync mirrors only after mj_step2.
-        mj_step1(m, d);
+        TrapCall(mj_step1, m, d);
         for (auto& s : bound_) {
           if (s->mirror) {
             std::memcpy(s->mirror.get() + i * s->row, s->buf.get() + i * s->row, s->row);
           }
         }
-        mj_step2(m, d);
+        TrapCall(mj_step2, m, d);
         if (cctx->hist) {
-          mj_getState(m, d, cctx->hist + static_cast<size_t>(cctx->k) * nstate_,
-                      mjSTATE_INTEGRATION);
+          TrapCall(mj_getState, m, d,
+                   cctx->hist + static_cast<size_t>(cctx->k) * nstate_, mjSTATE_INTEGRATION);
         }
-        mj_getState(m, d, State(i), mjSTATE_INTEGRATION);
+        TrapCall(mj_getState, m, d, State(i), mjSTATE_INTEGRATION);
         std::memcpy(Warning(i), d->warning, sizeof(d->warning));
         if (cctx->k + 1 != cctx->nstep) return;
         cctx->done[0] = 1;
-        if (forward_) mj_forward(m, d);
+        if (forward_) TrapCall(mj_forward, m, d);
         for (auto& s : bound_) CopyOut(*s, d, i);
         return;
       }
       case Op::Forward:
       case Op::Reset:
-        mj_forward(m, d);
+        TrapCall(mj_forward, m, d);
         break;
       case Op::RefreshSensor:
-        mj_kinematics(m, d);
-        mj_comPos(m, d);
-        mj_comVel(m, d);
-        mj_sensorPos(m, d);
-        mj_sensorVel(m, d);
+        TrapCall(mj_kinematics, m, d);
+        TrapCall(mj_comPos, m, d);
+        TrapCall(mj_comVel, m, d);
+        TrapCall(mj_sensorPos, m, d);
+        TrapCall(mj_sensorVel, m, d);
         for (int j = 0; j < static_cast<int>(ctx->sensor_ranges->size()); j += 2) {
           CopySensorRange(*ctx->sensor, d, i, (*ctx->sensor_ranges)[j],
                           (*ctx->sensor_ranges)[j + 1] - (*ctx->sensor_ranges)[j]);
@@ -979,18 +1015,18 @@ class Batch {
       // derived fields into the bound views; the outputs are the
       // caller-allocated rows.
       case Op::JacSite:
-        mj_kinematics(m, d);
-        mj_comPos(m, d);
-        mj_jacSite(m, d, ctx->jacp, ctx->jacr, ctx->site);
+        TrapCall(mj_kinematics, m, d);
+        TrapCall(mj_comPos, m, d);
+        TrapCall(mj_jacSite, m, d, ctx->jacp, ctx->jacr, ctx->site);
         return;
       case Op::SampleHfield:
-        mj_kinematics(m, d);
+        TrapCall(mj_kinematics, m, d);
         SampleHfield(m, d, *ctx);
         return;
       case Op::SetConst:
         break;
     }
-    mj_getState(m, d, State(i), mjSTATE_INTEGRATION);
+    TrapCall(mj_getState, m, d, State(i), mjSTATE_INTEGRATION);
     std::memcpy(Warning(i), d->warning, sizeof(d->warning));
     for (auto& s : bound_) CopyOut(*s, d, i);
   }
@@ -1023,23 +1059,13 @@ class Batch {
     return out;
   }
 
-  // Keep the setjmp frame separate from the worker lambda. Returning a status
-  // also prevents MSVC from turning either call below into a tail call, which
-  // would discard the caller frame that longjmp must return through.
-#if defined(_MSC_VER)
-  __declspec(noinline)
-#endif
+  // TrapCall throws only after its short longjmp has returned to C++, so the
+  // exception can unwind RunSim normally instead of crossing MuJoCo C frames.
   bool Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
                const CallbackCtx* cctx) {
-    mjfLogHandler previous = _mjPRIVATE_setTlsLogHandler(LogTrap);
-    tls_prev_handler = previous;
-    tls_jmp_active = true;
-    if (setjmp(tls_jmp_buf) == 0) {
+    try {
       RunSim(t, i, op, arg, hist, ctx, cctx);
-    } else {
-      tls_jmp_active = false;
-      _mjPRIVATE_setTlsLogHandler(previous);
-      tls_prev_handler = nullptr;
+    } catch (const MjError&) {
       // The sim's state was not written back; the worker's mjData, left
       // mid-call with its stack and arena in use, serves other sims next.
       if (op == Op::SetConst) Restore(models_[t]);
@@ -1048,9 +1074,6 @@ class Batch {
       if (error_.empty()) error_ = "sim " + std::to_string(i) + ": " + tls_error;
       return false;
     }
-    tls_jmp_active = false;
-    _mjPRIVATE_setTlsLogHandler(previous);
-    tls_prev_handler = nullptr;
     return true;
   }
 
