@@ -11,7 +11,6 @@
 #include <nanobind/ndarray.h>
 
 #include <algorithm>
-#include <csetjmp>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +25,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
@@ -390,16 +390,17 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
   }
 }
 
-// mju_error trap for worker threads: record the message and unwind to the
-// worker's setjmp; everything else goes to the handler that was active before.
-inline thread_local std::jmp_buf* tls_jmp = nullptr;
-inline thread_local std::string tls_error;
+// mju_error trap for worker threads: throw back to the worker's guard;
+// everything else goes to the handler that was active before.
+struct MjError : std::exception {
+  std::string message;
+  explicit MjError(std::string text) : message(std::move(text)) {}
+  const char* what() const noexcept override { return message.c_str(); }
+};
 inline mjfLogHandler prev_log_handler = nullptr;
+inline thread_local bool tls_guarded = false;
 inline void LogTrap(const mjLogMessage* msg) {
-  if (msg->level == mjLOG_ERROR && tls_jmp) {
-    tls_error = msg->subject;
-    std::longjmp(*tls_jmp, 1);
-  }
+  if (msg->level == mjLOG_ERROR && tls_guarded) throw MjError(msg->subject);
   prev_log_handler(msg);
 }
 inline void InstallLogTrap() { prev_log_handler = mju_setLogHandler(LogTrap); }
@@ -1009,20 +1010,21 @@ class Batch {
 
   void Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
                const CallbackCtx* cctx) {
-    std::jmp_buf jb;
-    tls_jmp = &jb;
-    if (setjmp(jb) == 0) {
+    struct TrapGuard {
+      bool previous;
+      TrapGuard() : previous(std::exchange(tls_guarded, true)) {}
+      ~TrapGuard() { tls_guarded = previous; }
+    } trap_guard;
+    try {
       RunSim(t, i, op, arg, hist, ctx, cctx);
-    } else {
+    } catch (const MjError& e) {
       // The sim's state was not written back; the worker's mjData, left
       // mid-call with its stack and arena in use, serves other sims next.
-      tls_jmp = nullptr;
       if (op == Op::SetConst) Restore(models_[t]);
       mj_resetData(template_, data_[t]);
       std::lock_guard<std::mutex> lock(changed_mu_);
-      if (error_.empty()) error_ = "sim " + std::to_string(i) + ": " + tls_error;
+      if (error_.empty()) error_ = "sim " + std::to_string(i) + ": " + e.what();
     }
-    tls_jmp = nullptr;
   }
 
   void Run(Op op, std::optional<std::vector<int>> sel, int arg, mjtNum* hist = nullptr,
