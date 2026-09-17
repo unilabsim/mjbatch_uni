@@ -400,7 +400,13 @@ struct MjError : std::exception {
 inline mjfLogHandler prev_log_handler = nullptr;
 inline thread_local bool tls_guarded = false;
 inline void LogTrap(const mjLogMessage* msg) {
-  if (msg->level == mjLOG_ERROR && tls_guarded) throw MjError(msg->subject);
+  if (msg->level == mjLOG_ERROR && tls_guarded) {
+#ifdef _WIN32
+    std::fprintf(stderr, "MJDIAG trap\n");
+    std::fflush(stderr);
+#endif
+    throw MjError(msg->subject);
+  }
   prev_log_handler(msg);
 }
 inline void InstallLogTrap() { prev_log_handler = mju_setLogHandler(LogTrap); }
@@ -1018,10 +1024,18 @@ class Batch {
     try {
       RunSim(t, i, op, arg, hist, ctx, cctx);
     } catch (const MjError& e) {
+#ifdef _WIN32
+      std::fprintf(stderr, "MJDIAG catch sim %d\n", i);
+      std::fflush(stderr);
+#endif
       // The sim's state was not written back; the worker's mjData, left
       // mid-call with its stack and arena in use, serves other sims next.
       if (op == Op::SetConst) Restore(models_[t]);
       mj_resetData(template_, data_[t]);
+#ifdef _WIN32
+      std::fprintf(stderr, "MJDIAG reset sim %d\n", i);
+      std::fflush(stderr);
+#endif
       std::lock_guard<std::mutex> lock(changed_mu_);
       if (error_.empty()) error_ = "sim " + std::to_string(i) + ": " + e.what();
     }
@@ -1033,7 +1047,13 @@ class Batch {
     std::lock_guard<std::mutex> lock(mu_);
     error_.clear();
     RunLocked(op, sel, arg, hist, ctx);
-    if (!error_.empty()) throw std::runtime_error(error_);
+    if (!error_.empty()) {
+#ifdef _WIN32
+      std::fprintf(stderr, "MJDIAG run error\n");
+      std::fflush(stderr);
+#endif
+      throw std::runtime_error(error_);
+    }
   }
 
   // A per-sim enableflags must not switch on what the constructor refused. Raised
