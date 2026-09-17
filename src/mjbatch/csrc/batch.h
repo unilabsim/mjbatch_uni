@@ -1023,6 +1023,9 @@ class Batch {
     return out;
   }
 
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#endif
   void Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
                const CallbackCtx* cctx) {
     mjfLogHandler previous = _mjPRIVATE_setTlsLogHandler(LogTrap);
