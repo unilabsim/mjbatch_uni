@@ -99,6 +99,18 @@ handler installed at import; installing another handler later disables it.)")
            "so they affect the current substep. If the callback raises, state remains at "
            "the last completed substep; intermediate mjData is recovered on the next call.")
       .def("forward", &Batch::forward, "ids"_a.noconvert() = nb::none())
+      .def("refresh_sensor_range", &Batch::refresh_sensor_range, "ids"_a.noconvert() = nb::none(),
+           "sensor_range"_a,
+           "Refresh position- and velocity-stage sensors in a half-open sensordata column "
+           "range from each selected simulation's final integration state. The work runs "
+           "in native worker threads and only the declared columns are copied into the "
+           "bound sensordata view; acceleration-stage sensors (including contact forces) "
+           "and every other bound field are preserved.")
+      .def("refresh_sensor_ranges", &Batch::refresh_sensor_ranges, "ids"_a.noconvert() = nb::none(),
+           "sensor_ranges"_a,
+           "Refresh disjoint position- and velocity-stage sensor column ranges, expressed "
+           "as a flattened sequence of half-open (start, stop) pairs. Semantics match "
+           "refresh_sensor_range(); columns outside every requested range are preserved.")
       .def("reset", &Batch::reset, "ids"_a.noconvert() = nb::none(), "keyframe"_a = -1,
            "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.")
       .def("jac_site", &Batch::jac_site, "site"_a, "jacp"_a.noconvert() = nb::none(),
