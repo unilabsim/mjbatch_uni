@@ -52,7 +52,18 @@ _SHARED_PARAMETER_PREFIXES = (
   "qpos0",
   "qpos_spring",
 )
-_IGNORED_COMPILER_FLAGS = frozenset({"body_sameframe", "geom_sameframe"})
+# Compiler-derived fields, not structure: ``body_simple``/``dof_simplenum``
+# are fast-path flags/counts the compiler derives from each variant's own
+# inertial frames, and ``light_poscom0`` is derived from the model's center of
+# mass.  They legitimately differ across same-layout variants whose allowed
+# per-variant fields (``body_mass``/``body_ipos``/``body_iquat``/
+# ``body_inertia``, geom pose/size) already carry the underlying physics, and
+# none of them changes the dynamics computed with the canonical model's
+# flags.  Treating them as shared skeleton parameters falsely rejects
+# mass-varying pools (unilabsim/mjbatch_uni#33).
+_IGNORED_COMPILER_FLAGS = frozenset(
+  {"body_sameframe", "geom_sameframe", "body_simple", "dof_simplenum", "light_poscom0"}
+)
 _IGNORED_COMPILER_METADATA_PREFIXES = ("body_geom", "body_bvh", "geom_bvh")
 
 _LAYOUT_SCALARS = (
@@ -142,6 +153,7 @@ class VariantPack:
         mesh_names[mesh.name] = pooled_name
       mesh_names_by_variant.append(mesh_names)
 
+    _disable_simple_where_variants_break_inertial_frame(canonical_spec, reference_models, canonical_index)
     canonical = canonical_spec.compile()
     _validate_layout(reference_models, canonical)
     geom_maps = _validate_names_and_build_geom_maps(reference_models, canonical)
@@ -347,6 +359,44 @@ def _validate_shared_parameters(
       canonical_values = expected[geom_map] if name.startswith("geom_") else expected
       if not np.array_equal(canonical_values, actual):
         raise ValueError(f"variant {variant} changes shared field {name}")
+
+
+def _disable_simple_where_variants_break_inertial_frame(
+  canonical_spec: mujoco.MjSpec,
+  references: Sequence[mujoco.MjModel],
+  canonical_index: int,
+) -> None:
+  """Force the general (non-simple) code path where variant inertia requires it.
+
+  The compiler marks a body ``simple`` when its inertial frame coincides with
+  the body frame (zero ``ipos``, identity ``iquat``), and the batch executor
+  refuses per-variant inertial writes that break that invariant on a simple
+  canonical body ("compiled as simple but sameframe no longer holds").
+  Variant pools legitimately differ in exactly those allowed variant fields,
+  so the canonical model must not carry the fast-path flag on such bodies.
+  ``simple=False`` is a codegen hint only; the compiled dynamics are
+  numerically identical.
+  """
+  canonical = references[canonical_index]
+  # MjSpec.bodies is the flattened depth-first list, aligned with the compiled
+  # model's body ids (world first in both).
+  spec_bodies = list(canonical_spec.bodies)[1:]
+  if len(spec_bodies) != canonical.nbody - 1:
+    raise ValueError(
+      f"canonical spec has {len(spec_bodies)} bodies but its compiled model has "
+      f"{canonical.nbody - 1}; cannot map the simple flags"
+    )
+  zero = np.zeros(3)
+  identity = np.array([1.0, 0.0, 0.0, 0.0])
+  for spec_body, body_id in zip(spec_bodies, range(1, canonical.nbody), strict=True):
+    if not canonical.body_simple[body_id]:
+      continue
+    for reference in references:
+      if not np.array_equal(reference.body_ipos[body_id], zero) or not np.array_equal(
+        reference.body_iquat[body_id], identity
+      ):
+        spec_body.simple = False
+        break
 
 
 def _validate_shared_options(

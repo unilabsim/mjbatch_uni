@@ -399,6 +399,97 @@ def test_variant_pack_rejects_shared_parameter_changes(tmp_path):
     VariantPack.from_specs([make_spec("-1 1"), make_spec("-2 2")])
 
 
+def test_variant_pack_allows_compiler_derived_simplicity_flags(tmp_path):
+  """Same-layout variants whose inertial frames differ must pack (#33).
+
+  A body whose COM sits exactly at the body frame compiles with
+  ``body_simple=1`` (and its dofs counted in ``dof_simplenum``); siblings with
+  an offset COM compile with 0.  These are compiler-derived fast-path flags,
+  not structure or physics: the per-variant inertial fields
+  (``body_mass``/``body_ipos``/``body_inertia``) already carry the actual
+  differences, and the canonical executor's math is flag-independent.
+  """
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def make_spec(com_x: float):
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <option timestep="0.002"/>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 .1"/>
+    <body name="body" pos="0 0 .5">
+      <freejoint name="free"/>
+      <inertial pos="{com_x} 0 0" mass="1" diaginertia=".01 .01 .01"/>
+      <geom name="mesh" type="mesh" mesh="mesh" density="0"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    )
+
+  specs = [make_spec(0.0), make_spec(0.05)]
+  models = [spec.compile() for spec in specs]
+  body_id = models[0].body("body").id
+  # The regression only bites when the compiled flags genuinely differ.
+  assert models[0].body_simple[body_id] != models[1].body_simple[body_id]
+  assert models[0].dof_simplenum[0] != models[1].dof_simplenum[0]
+
+  pack = VariantPack.from_specs(specs)
+  assert pack.num_variants == 2
+  np.testing.assert_array_equal(
+    pack.fields["body_ipos"][:, body_id], [models[0].body_ipos[body_id], models[1].body_ipos[body_id]]
+  )
+
+  assignment = np.arange(N) % 2
+  batch = Batch.from_variant_pack(pack, N, assignment, num_threads=3)
+  state = batch.bind("state")
+  batch.step(nstep=25)
+  for variant, reference in enumerate(models):
+    data = mujoco.MjData(reference)
+    for _ in range(25):
+      mujoco.mj_step(reference, data)
+    expected = np.empty(batch.nstate)
+    mujoco.mj_getState(reference, data, expected, mujoco.mjtState.mjSTATE_INTEGRATION)
+    rows = np.flatnonzero(assignment == variant)
+    np.testing.assert_array_equal(state[rows], np.tile(expected, (len(rows), 1)))
+
+
+def test_variant_pack_allows_com_derived_light_poscom0():
+  """Variants whose model COM differs shift ``light_poscom0`` (#33).
+
+  ``light_poscom0`` is derived from the model's center of mass at ``qpos0``
+  and only feeds rendering, so same-layout variants whose inertial offsets
+  move the COM must pack.
+  """
+
+  def make_spec(com_x: float):
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <worldbody>
+    <light name="top" pos="0 0 2" dir="0 0 -1" directional="true"/>
+    <body name="body" pos=".2 0 .5">
+      <freejoint name="free"/>
+      <inertial pos="{com_x} 0 0" mass="1" diaginertia=".01 .01 .01"/>
+      <geom name="box" type="box" size=".1 .1 .1" density="0"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    )
+
+  specs = [make_spec(0.05), make_spec(0.15)]
+  models = [spec.compile() for spec in specs]
+  # The regression only bites when the compiled values genuinely differ.
+  assert not np.array_equal(models[0].light_poscom0, models[1].light_poscom0)
+
+  pack = VariantPack.from_specs(specs)
+  assert pack.num_variants == 2
+
+
 def test_model_affine_batch_routes_global_ids(model):
   other = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
   group_batch, other_batch = Batch(model, N // 2), Batch(other, N // 2)
