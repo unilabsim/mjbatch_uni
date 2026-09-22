@@ -13,7 +13,7 @@ import pytest
 
 from mjbatch import Batch, ModelAffineBatch, ModelFieldSpec, RecomputeLevel
 from mjbatch._bindings import Batch as RawBatch
-from mjbatch.variants import VariantPack
+from mjbatch.variants import VariantPack, VariantPackBuilder
 
 XML = """
 <mujoco>
@@ -455,6 +455,130 @@ def test_variant_pack_allows_compiler_derived_simplicity_flags(tmp_path):
     mujoco.mj_getState(reference, data, expected, mujoco.mjtState.mjSTATE_INTEGRATION)
     rows = np.flatnonzero(assignment == variant)
     np.testing.assert_array_equal(state[rows], np.tile(expected, (len(rows), 1)))
+
+
+def _make_scaled_mesh_spec_factory(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def make_spec(scale_a: str, scale_b: str, *, include_b: bool = True):
+    meshes = f'<mesh name="a" file="{obj_path}" scale="{scale_a}"/>'
+    if include_b:
+      meshes += f'<mesh name="b" file="{obj_path}" scale="{scale_b}"/>'
+    geoms = '<geom name="a" type="mesh" mesh="a" mass="1"/>'
+    if include_b:
+      geoms += '<geom name="b" type="mesh" mesh="b" mass="1"/>'
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <option timestep="0.002"/>
+  <asset>{meshes}</asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 .1"/>
+    <body name="body" pos=".01 .02 .8">
+      <freejoint name="free"/>
+      {geoms}
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    )
+
+  variants = [("1 1 1", "1 1 1", True), (".7 .8 1.2", ".9 .9 .9", True), (".5 .6 .7", "1 1 1", False)]
+
+  def fresh_specs():
+    return [make_spec(a, b, include_b=include) for a, b, include in variants]
+
+  return fresh_specs
+
+
+def test_variant_pack_builder_matches_from_specs_bit_for_bit(tmp_path):
+  fresh_specs = _make_scaled_mesh_spec_factory(tmp_path)
+  pack = VariantPack.from_specs(fresh_specs())
+
+  builder = VariantPackBuilder()
+  for spec in fresh_specs():
+    builder.add_variant(spec)
+  assert builder.num_variants == 3
+  assert builder.canonical_index == 0
+  streamed = builder.build(fresh_specs()[builder.canonical_index])
+
+  assert streamed.num_variants == pack.num_variants
+  assert set(streamed.fields) == set(pack.fields)
+  for name in pack.fields:
+    np.testing.assert_array_equal(streamed.fields[name], pack.fields[name], name)
+  assert streamed.model.nmesh == pack.model.nmesh
+  assert streamed.model.ngeom == pack.model.ngeom
+  assert [streamed.model.mesh(i).name for i in range(streamed.model.nmesh)] == [
+    pack.model.mesh(i).name for i in range(pack.model.nmesh)
+  ]
+  for name in ("mesh_vert", "mesh_face", "geom_size", "geom_dataid", "body_mass", "body_simple"):
+    np.testing.assert_array_equal(getattr(streamed.model, name), getattr(pack.model, name), name)
+
+  assignment = np.arange(N) % 3
+  batch = Batch.from_variant_pack(streamed, N, assignment, num_threads=3)
+  batch.step(nstep=5)
+
+
+def test_variant_pack_builder_accepts_precompiled_models(tmp_path):
+  fresh_specs = _make_scaled_mesh_spec_factory(tmp_path)
+  pack = VariantPack.from_specs(fresh_specs())
+
+  builder = VariantPackBuilder()
+  for spec in fresh_specs():
+    builder.add_variant(spec, model=spec.compile())
+  streamed = builder.build(fresh_specs()[builder.canonical_index])
+  for name in pack.fields:
+    np.testing.assert_array_equal(streamed.fields[name], pack.fields[name], name)
+
+
+def test_variant_pack_builder_releases_specs_and_models(tmp_path):
+  import gc
+  import weakref
+
+  fresh_specs = _make_scaled_mesh_spec_factory(tmp_path)
+  builder = VariantPackBuilder()
+  refs = []
+  for spec in fresh_specs():
+    refs.append((weakref.ref(spec), weakref.ref(builder.add_variant(spec))))
+    del spec
+  gc.collect()
+  dead = [not spec_ref() and not model_ref() for spec_ref, model_ref in refs]
+  assert all(dead)
+  assert builder.build(fresh_specs()[builder.canonical_index]).num_variants == 3
+
+
+def test_variant_pack_builder_rejects_shared_parameter_changes(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def make_spec(ctrlrange: str):
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody>
+    <body><freejoint name="free"/><geom name="mesh" type="mesh" mesh="mesh"/></body>
+  </worldbody>
+  <actuator><motor joint="free" ctrlrange="{ctrlrange}"/></actuator>
+</mujoco>
+"""
+    )
+
+  builder = VariantPackBuilder()
+  builder.add_variant(make_spec("-1 1"))
+  builder.add_variant(make_spec("-2 2"))
+  with pytest.raises(ValueError, match="changes shared field actuator_ctrlrange"):
+    builder.build(make_spec("-1 1"))
+
+
+def test_variant_pack_builder_requires_variants(tmp_path):
+  fresh_specs = _make_scaled_mesh_spec_factory(tmp_path)
+  builder = VariantPackBuilder()
+  with pytest.raises(ValueError, match="at least one variant spec is required"):
+    _ = builder.canonical_index
+  with pytest.raises(ValueError, match="at least one variant spec is required"):
+    builder.build(fresh_specs()[0])
 
 
 def test_variant_pack_allows_com_derived_light_poscom0():
