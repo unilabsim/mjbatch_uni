@@ -15,7 +15,8 @@ from mjbatch.groups import TopologyGroup as TopologyGroup
 from mjbatch.model import ModelFieldSpec as ModelFieldSpec
 from mjbatch.model import RecomputeLevel as RecomputeLevel
 from mjbatch.model import build_model_fields
-from mjbatch.variants import VariantPack
+from mjbatch.variants import VariantPack as VariantPack
+from mjbatch.variants import VariantPackBuilder as VariantPackBuilder
 
 _QPOS_WIDTH = {0: 7, 1: 4, 2: 1, 3: 1}  # by mjtJoint: free, ball, slide, hinge
 _DOF_WIDTH = {0: 6, 1: 3, 2: 1, 3: 1}
