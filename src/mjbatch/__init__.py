@@ -196,20 +196,6 @@ class Batch(_Batch):
     ids = np.asarray(ids)
     return int(ids.sum()) if ids.dtype == bool else len(ids)
 
-  def jac_site(  # pyright: ignore[reportIncompatibleMethodOverride]  # name-based allocating wrapper
-    self, name: str, ids: Any = None
-  ) -> tuple[np.ndarray, np.ndarray]:
-    """World-frame position/rotation Jacobians of a site, per selected simulation.
-
-    Returns (jacp, jacr) with shape (nsel, 3, nv). Runs kinematics and comPos
-    only, not mj_forward, and does not refresh the bound views."""
-    i = self.model.site(name).id
-    n = self._nsel(ids)
-    jacp = np.zeros((n, 3, self.model.nv))
-    jacr = np.zeros((n, 3, self.model.nv))
-    super().jac_site(i, jacp, jacr, ids)
-    return jacp, jacr
-
   def sample_hfield(  # pyright: ignore[reportIncompatibleMethodOverride]  # name-based allocating wrapper
     self,
     geom: str,

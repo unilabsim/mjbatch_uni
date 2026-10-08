@@ -12,7 +12,7 @@ Features include:
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
 * Same-layout compiler-coherent mesh variants, with `VariantPack.from_specs()` and `Batch.from_variant_pack()`.
 * Explicit topology-affine groups, with `ModelAffineBatch` routing global ids to incompatible layouts.
-* Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield` (world/yaw grid alignment); query ops return caller-allocated results without refreshing the bound views.
+* Batched queries beyond stepping: ray casting with `rays`, body-point Jacobians with `jac`, and heightfield sampling with `sample_hfield` (world/yaw grid alignment); query ops return caller-allocated results without refreshing the bound views.
 * Per-substep control from Python with `step(..., callback=...)`.
 * Opt-in split substeps with fresh position/velocity sensor views for body wrench control.
 * Optional per-worker CPU pinning on Linux, with `cpu_ids` binding pool worker `i` to `cpu_ids[i]`.

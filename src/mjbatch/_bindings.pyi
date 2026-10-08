@@ -1,6 +1,7 @@
 from collections.abc import Callable, Sequence
 from typing import Annotated
 
+import numpy
 from numpy.typing import NDArray
 
 
@@ -53,6 +54,11 @@ class Batch:
     the first failing simulation; the others still ran, and the failing one keeps the
     state it had before the call, its writes still pending. The trap is a MuJoCo log
     handler installed at import; installing another handler later disables it.
+
+    rays and jac are queries: mj_ray and mj_jac for each simulation against its own
+    geometry, which is its state with pending writes on top and its expanded model
+    fields. A query runs only the part of the pipeline it needs, consumes no pending
+    write, and updates no bound field.
     """
 
     def __init__(self, model: object, num_sims: int, num_threads: int = 0, forward: bool = False, cpu_ids: Sequence[int] | None = None) -> None:
@@ -99,14 +105,19 @@ class Batch:
         mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.
         """
 
-    def jac_site(self, site: int, jacp: NDArray | None = None, jacr: NDArray | None = None, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None:
-        """
-        mj_jacSite per selected simulation into caller-allocated (sel, 3, nv) rows; either output may be None. Runs mj_kinematics and mj_comPos only, not mj_forward, and does not refresh the bound views: the outputs are the caller-allocated rows.
-        """
-
     def sample_hfield(self, geom: int, body: int, offsets: NDArray, out: NDArray, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, alignment: str = 'world') -> None:
         """
         Bilinear hfield sampling per selected simulation at XY offsets around a frame body's origin, into caller-allocated (sel, npoint) rows: the world z of the sampled hfield surface (the local elevation for an unrotated geom at the origin). alignment rotates the sampling grid: "world" keeps offsets in world axes, "yaw" rotates them by the frame body's yaw about world z. Runs mj_kinematics only, not mj_forward, and does not refresh the bound views. All simulations sample the template's hfield; a per-sim geom_pos or geom_quat moves the sampling frame.
         """
 
     def set_const(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...
+
+    def rays(self, pnt: NDArray, vec: NDArray, dist: NDArray, geomid: NDArray | None = None, normal: NDArray | None = None, geomgroup: Annotated[NDArray[numpy.uint8], dict(shape=(6), order='C', writable=False)] | None = None, flg_static: bool = True, bodyexclude: Annotated[NDArray[numpy.int32], dict(shape=(None,), order='C', writable=False)] | None = None, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None:
+        """
+        mj_ray for every ray of every simulation. pnt and vec are (num_sims, nray, 3) origins and directions in the world frame, float32 or the native dtype. dist (num_sims, nray), and the optional geomid (int32) and normal (num_sims, nray, 3), are caller-allocated and filled in place: dist is -1 and normal zero where a ray hits nothing. geomgroup is mj_ray's six-entry uint8 mask, bodyexclude one int32 body id per ray (-1 for none), and ids restricts which rows are computed.
+        """
+
+    def jac(self, jacp: NDArray | None, jacr: NDArray | None, point: NDArray, body: Annotated[NDArray[numpy.int32], dict(shape=(None,), order='C', writable=False)], ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None:
+        """
+        mj_jac for one point per simulation. point is (num_sims, 3) in the world frame, float32 or the native dtype, and body (num_sims,) int32 is the body it moves with. jacp and jacr are caller-allocated (num_sims, 3, nv) arrays filled in place with the translational and rotational Jacobians; either may be None. ids restricts which rows are computed.
+        """

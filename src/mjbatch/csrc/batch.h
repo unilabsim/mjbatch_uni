@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -327,7 +329,92 @@ struct Scalars {
   }
 };
 
-// SampleHfield grid alignment:ot return. A thread-local handler and longjmp
+// SampleHfield grid alignment: offsets stay in world axes (World) or rotate
+// with the frame body's yaw about world z (Yaw).  This is the mujoco_uni
+// BatchEnvPool.sample_hfield_height convention, which this op replaces.
+enum class HfieldAlign { World, Yaw };
+
+// Per-call context for the query ops (SampleHfield): outputs are caller-
+// allocated arrays, one row per selected sim, like step's history.
+struct QueryCtx {
+  int geom = -1, body = -1;   // SampleHfield: hfield geom id, frame body id
+  const mjtNum* offsets = nullptr;  // (npoint, 2) grid-frame XY around the body origin
+  int npoint = 0;
+  HfieldAlign align = HfieldAlign::World;  // SampleHfield: sampling grid rotation
+  mjtNum* out = nullptr;      // (sel, npoint) rows
+  Slot* sensor = nullptr;     // RefreshSensor: bound sensordata slot
+  const std::vector<int>* sensor_ranges = nullptr;  // flattened (start, stop) pairs
+};
+
+// One substep of a callback-driven step (Op::Substep): the calling thread
+// dispatches substeps one at a time and runs the Python callback in between,
+// so a sim's state round-trips through its states_ row every substep.
+struct CallbackCtx {
+  int k = 0, nstep = 1;
+  mjtNum* hist = nullptr;   // (sel, nstep, nstate) row for this sim
+  uint8_t* done = nullptr;  // set when this selection row runs its copy-out tail
+  bool tail_only = false;   // exception cleanup: no mj_step, copy out where it stopped
+  Slot* sensor = nullptr;   // Substep1: bound sensordata slot receiving selected columns
+  int sensor_start = 0;
+  int sensor_width = 0;
+};
+
+// Bilinear sampling of one hfield geom at XY offsets from a frame body's origin.
+// The offsets form a sampling grid rotated per ctx.align: World keeps them in
+// world axes, Yaw rotates them by the frame body's yaw about world z (extracted
+// from xmat). Sample points are taken in the plane through the geom center,
+// then transformed into the geom's local frame (its pose comes from the sim's
+// mjData, so per-sim geom_pos/geom_quat apply); the hfield grid itself is the
+// model's, shared by all sims. The grid mapping and clamping match MuJoCo's
+// hfield contact convention for the XY extent [-size[0], size[0]] x
+// [-size[1], size[1]]. The output is the world z of the sampled surface point
+// (for an unrotated geom at the origin, the local elevation interp * size[2]).
+
+inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx) {
+  int hfield = m->geom_dataid[ctx.geom];
+  int nrow = m->hfield_nrow[hfield], ncol = m->hfield_ncol[hfield];
+  const mjtNum* hsize = m->hfield_size + static_cast<size_t>(4) * hfield;
+  const float* data = m->hfield_data + static_cast<size_t>(hfield) * nrow * ncol;
+  const mjtNum* gpos = d->geom_xpos + 3 * ctx.geom;
+  const mjtNum* gmat = d->geom_xmat + 9 * ctx.geom;
+  const mjtNum* bpos = d->xpos + 3 * ctx.body;
+  const mjtNum* bmat = d->xmat + 9 * ctx.body;
+  mjtNum cyaw = 1.0, syaw = 0.0;  // frame body yaw about world z, for HfieldAlign::Yaw
+  if (ctx.align == HfieldAlign::Yaw) {
+    // xmat is row-major world = R * body; the body x-axis in world is column 0.
+    cyaw = mju_cos(mju_atan2(bmat[3], bmat[0]));
+    syaw = mju_sin(mju_atan2(bmat[3], bmat[0]));
+  }
+  for (int k = 0; k < ctx.npoint; ++k) {
+    mjtNum ox = ctx.offsets[2 * k], oy = ctx.offsets[2 * k + 1];
+    mjtNum rx = ox, ry = oy;
+    if (ctx.align == HfieldAlign::Yaw) {
+      rx = cyaw * ox - syaw * oy;
+      ry = syaw * ox + cyaw * oy;
+    }
+    // Both alignments sample in the geom-center plane.
+    mjtNum wp[3] = {bpos[0] + rx, bpos[1] + ry, gpos[2]};
+    mjtNum rel[3], lp[3];
+    mju_sub3(rel, wp, gpos);
+    mju_mulMatTVec(lp, gmat, rel, 3, 3);
+    mjtNum fx = (lp[0] / hsize[0] + 1.0) * 0.5 * (ncol - 1);
+    mjtNum fy = (lp[1] / hsize[1] + 1.0) * 0.5 * (nrow - 1);
+    fx = std::min(std::max(fx, 0.0), ncol - 1.001);
+    fy = std::min(std::max(fy, 0.0), nrow - 1.001);
+    int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
+    mjtNum sx = fx - ix, sy = fy - iy;
+    int ix1 = std::min(ix + 1, ncol - 1), iy1 = std::min(iy + 1, nrow - 1);
+    mjtNum h = (1 - sx) * (1 - sy) * data[iy * ncol + ix] +
+               sx * (1 - sy) * data[iy * ncol + ix1] +
+               (1 - sx) * sy * data[iy1 * ncol + ix] +
+               sx * sy * data[iy1 * ncol + ix1];
+    h *= hsize[2];
+    // World z of the surface point above the sample: gpos + gmat @ (lp0, lp1, h).
+    ctx.out[k] = gpos[2] + gmat[6] * lp[0] + gmat[7] * lp[1] + gmat[8] * h;
+  }
+}
+
+// MuJoCo error handlers must not return. A thread-local handler and longjmp
 // keep the unwind within the worker's C++ frame, matching the official Python
 // bindings, without changing handlers owned by other threads.
 inline thread_local std::jmp_buf tls_jmp_buf = {};
@@ -407,8 +494,8 @@ class Batch {
     Reset,
     RefreshSensor,
     SetConst,
-    JacSite,
-    SampleHfield
+    SampleHfield,
+    Query
   };
   using Ids = nb::ndarray<nb::ndim<1>, nb::c_contig>;
 
@@ -590,25 +677,6 @@ class Batch {
     if (!error_.empty()) throw std::runtime_error(error_);
   }
 
-  // mj_jacSite per selected sim into caller-allocated (sel, 3, nv) rows; either
-  // output may be omitted. Runs kinematics and comPos only, not mj_forward, and
-  // does not refresh the bound views: the outputs are the caller-allocated rows.
-  void jac_site(int site, std::optional<nb::ndarray<>> jacp,
-                std::optional<nb::ndarray<>> jacr, std::optional<Ids> ids) {
-    ReentryGuard();
-    if (site < 0 || site >= template_->nsite) throw nb::value_error("site out of range");
-    auto sel = Parse(ids);
-    int nsel = sel ? static_cast<int>(sel->size()) : num_sims_;
-    QueryCtx ctx;
-    ctx.site = site;
-    ctx.jacp = jacp ? OutPtr(*jacp, nsel, 3, template_->nv, "jacp") : nullptr;
-    ctx.jacr = jacr ? OutPtr(*jacr, nsel, 3, template_->nv, "jacr") : nullptr;
-    if (!ctx.jacp && !ctx.jacr) {
-      throw nb::value_error("jacp and jacr cannot both be None");
-    }
-    Run(Op::JacSite, std::move(sel), 0, nullptr, &ctx);
-  }
-
   // Bilinear hfield sampling per selected sim at XY offsets around a frame
   // body's origin, into caller-allocated (sel, npoint) rows: the world z of
   // the sampled hfield surface. Runs kinematics only, not mj_forward, and does
@@ -643,7 +711,145 @@ class Batch {
     Run(Op::SampleHfield, std::move(sel), 0, nullptr, &ctx);
   }
 
+  // Queries read a sim's state with its pending writes on top, and its expanded model
+  // fields, and write nothing back. Each runs the part of the pipeline it needs.
+
+  // mj_ray for (N, R) rays given in the world frame.
+  void rays(nb::ndarray<> pnt, nb::ndarray<> vec, nb::ndarray<> dist,
+            std::optional<nb::ndarray<>> geomid, std::optional<nb::ndarray<>> normal,
+            std::optional<nb::ndarray<const uint8_t, nb::shape<mjNGROUP>, nb::c_contig>> geomgroup,
+            bool flg_static,
+            std::optional<nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig>> bodyexclude,
+            std::optional<Ids> ids) {
+    if (pnt.ndim() != 3) throw nb::value_error("pnt must have shape (num_sims, nray, 3)");
+    const size_t n = num_sims_, nray = pnt.shape(1);
+    const Elem real = RealOf(pnt);
+    const bool f32 = real == Elem::Float;
+    const void* origins = Array(pnt, "pnt", real, {n, nray, 3});
+    const void* directions = Array(vec, "vec", real, {n, nray, 3});
+    void* dists = Array(dist, "dist", real, {n, nray});
+    int* geomids =
+        geomid ? static_cast<int*>(Array(*geomid, "geomid", Elem::Int, {n, nray})) : nullptr;
+    void* normals = normal ? Array(*normal, "normal", real, {n, nray, 3}) : nullptr;
+    const mjtByte* group = geomgroup ? geomgroup->data() : nullptr;
+    if (bodyexclude && bodyexclude->shape(0) != nray) {
+      throw nb::value_error("bodyexclude must have nray entries");
+    }
+    const int* exclude = bodyexclude ? bodyexclude->data() : nullptr;
+    Query(ids, [=](const mjModel* m, mjData* d, int i) {
+      mj_kinematics(m, d);
+      if (m->nflex) mj_flex(m, d);
+      for (size_t k = 0; k < nray; ++k) {
+        const size_t at = i * nray + k;
+        mjtNum origin[3], direction[3], hit_normal[3];
+        for (int c = 0; c < 3; ++c) {
+          origin[c] = Get(origins, f32, 3 * at + c);
+          direction[c] = Get(directions, f32, 3 * at + c);
+        }
+        int hit = -1;
+        const mjtNum x = mj_ray(m, d, origin, direction, group, flg_static,
+                                exclude ? exclude[k] : -1, &hit, normals ? hit_normal : nullptr);
+        Put(dists, f32, at, x);
+        if (geomids) geomids[at] = hit;
+        for (int c = 0; normals && c < 3; ++c)
+          Put(normals, f32, 3 * at + c, x < 0 ? 0 : hit_normal[c]);
+      }
+    });
+  }
+
+  // mj_jac: the Jacobians of a world-frame point moving with a body.
+  void jac(std::optional<nb::ndarray<>> jacp, std::optional<nb::ndarray<>> jacr,
+           nb::ndarray<> point, nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig> body,
+           std::optional<Ids> ids) {
+    const size_t n = num_sims_, row = 3 * static_cast<size_t>(template_->nv);
+    const Elem real = RealOf(point);
+    const bool f32 = real == Elem::Float;
+    const void* points = Array(point, "point", real, {n, 3});
+    void* positional = jacp ? Array(*jacp, "jacp", real, {n, 3, row / 3}) : nullptr;
+    void* rotational = jacr ? Array(*jacr, "jacr", real, {n, 3, row / 3}) : nullptr;
+    if (body.shape(0) != n) throw nb::value_error("body must have num_sims entries");
+    const int* bodies = body.data();
+    for (size_t i = 0; i < n; ++i) {
+      if (bodies[i] < 0 || bodies[i] >= template_->nbody) {
+        throw nb::value_error("body ids must be in [0, nbody)");
+      }
+    }
+    Query(ids, [=](const mjModel* m, mjData* d, int i) {
+      mj_kinematics(m, d);
+      mj_comPos(m, d);
+      const mjtNum p[3] = {Get(points, f32, 3 * i), Get(points, f32, 3 * i + 1),
+                           Get(points, f32, 3 * i + 2)};
+      if (!f32) {
+        auto at = [=](void* a) { return a ? static_cast<mjtNum*>(a) + i * row : nullptr; };
+        mj_jac(m, d, at(positional), at(rotational), p, bodies[i]);
+        return;
+      }
+      mj_markStack(d);
+      mjtNum* jp = positional ? mj_stackAllocNum(d, row) : nullptr;
+      mjtNum* jr = rotational ? mj_stackAllocNum(d, row) : nullptr;
+      mj_jac(m, d, jp, jr, p, bodies[i]);
+      for (size_t k = 0; k < row; ++k) {
+        if (jp) Put(positional, true, i * row + k, jp[k]);
+        if (jr) Put(rotational, true, i * row + k, jr[k]);
+      }
+      mj_freeStack(d);
+    });
+  }
+
  private:
+  using QueryFn = std::function<void(const mjModel*, mjData*, int)>;
+
+  void Query(const std::optional<Ids>& ids, const QueryFn& fn) {
+    ReentryGuard();
+    auto sel = Parse(ids);
+    nb::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mu_);
+    error_.clear();
+    query_ = &fn;
+    RunLocked(Op::Query, sel, 0);
+    query_ = nullptr;
+    if (!error_.empty()) throw std::runtime_error(error_);
+  }
+
+  // float32 or mjtNum, whichever the array that sets a query's precision holds.
+  static Elem RealOf(const nb::ndarray<>& a) {
+    return a.dtype() == nb::dtype<float>() && sizeof(mjtNum) != sizeof(float) ? Elem::Float
+                                                                              : Elem::Num;
+  }
+
+  static void* Array(const nb::ndarray<>& a, const char* name, Elem elem,
+                     std::initializer_list<size_t> shape) {
+    const auto dtype = elem == Elem::Int     ? nb::dtype<int>()
+                       : elem == Elem::Float ? nb::dtype<float>()
+                                             : nb::dtype<mjtNum>();
+    bool ok = a.ndim() == shape.size() && a.dtype() == dtype &&
+              a.device_type() == nb::device::cpu::value && IsCContig(a);
+    std::string want;
+    size_t k = 0;
+    for (size_t extent : shape) {
+      ok = ok && a.shape(k++) == extent;
+      want += (want.empty() ? "" : ", ") + std::to_string(extent);
+    }
+    if (!ok) {
+      throw nb::value_error((std::string(name) + " must be a C-contiguous CPU " + DtypeName(elem) +
+                             " array of shape (" + want + ")")
+                                .c_str());
+    }
+    return a.data();
+  }
+
+  static mjtNum Get(const void* a, bool f32, size_t k) {
+    return f32 ? static_cast<const float*>(a)[k] : static_cast<const mjtNum*>(a)[k];
+  }
+
+  static void Put(void* a, bool f32, size_t k, mjtNum v) {
+    if (f32) {
+      static_cast<float*>(a)[k] = static_cast<float>(v);
+    } else {
+      static_cast<mjtNum*>(a)[k] = v;
+    }
+  }
+
   const FieldInfo& Field(const FieldTable& table, const std::string& name) {
     auto it = table.find(name);
     if (it == table.end()) {
@@ -981,19 +1187,14 @@ class Batch {
                           (*ctx->sensor_ranges)[j + 1] - (*ctx->sensor_ranges)[j]);
         }
         return;
-      // The query ops run kinematics only: they do not change the integration
-      // state, so the copy-out tail below is skipped. mjData is shared by every
-      // sim a worker serves, and copying out would leak another sim's stale
-      // derived fields into the bound views; the outputs are the
-      // caller-allocated rows.
-      case Op::JacSite:
-        TrapCall(mj_kinematics, m, d);
-        TrapCall(mj_comPos, m, d);
-        TrapCall(mj_jacSite, m, d, ctx->jacp, ctx->jacr, ctx->site);
-        return;
+      // Queries do not change the integration state, so the copy-out tail
+      // below is skipped; their outputs are the caller-allocated rows.
       case Op::SampleHfield:
         TrapCall(mj_kinematics, m, d);
         SampleHfield(m, d, *ctx);
+        return;
+      case Op::Query:
+        (*query_)(m, d, i);
         return;
       case Op::SetConst:
         break;
@@ -1108,8 +1309,6 @@ class Batch {
       const QueryCtx* c = nullptr;
       if (ctx) {
         row_ctx = *ctx;
-        if (row_ctx.jacp) row_ctx.jacp += static_cast<size_t>(j) * 3 * template_->nv;
-        if (row_ctx.jacr) row_ctx.jacr += static_cast<size_t>(j) * 3 * template_->nv;
         if (row_ctx.out) row_ctx.out += static_cast<size_t>(j) * row_ctx.npoint;
         c = &row_ctx;
       }
@@ -1236,6 +1435,7 @@ class Batch {
   std::set<const FieldInfo*> expanded_set_;
   const Slot* enableflags_ = nullptr;   // scanned for mjENBL_SLEEP before every call
   std::set<const FieldInfo*> changed_;  // set_const outputs not yet expanded
+  const QueryFn* query_ = nullptr;      // the query in flight, for workers
   std::unique_ptr<ThreadPool> pool_;
   std::mutex mu_;          // serializes calls; held with the GIL released in Run
   std::mutex changed_mu_;  // changed_ and error_ from workers
