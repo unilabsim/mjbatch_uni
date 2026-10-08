@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
+from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 import mujoco
 import numpy as np
 
-from mjbatch._bindings import Batch as _Batch
+if sys.platform == "win32":
+  # The extension links mujoco.dll, which lives in the mujoco package.
+  os.add_dll_directory(str(Path(mujoco.__file__).parent))
+
+from mjbatch._bindings import Batch as _Batch  # noqa: E402
 from mjbatch.groups import ModelAffineBatch as ModelAffineBatch
 from mjbatch.groups import TopologyGroup as TopologyGroup
 from mjbatch.model import ModelFieldSpec as ModelFieldSpec
@@ -195,20 +202,6 @@ class Batch(_Batch):
       return self.num_sims
     ids = np.asarray(ids)
     return int(ids.sum()) if ids.dtype == bool else len(ids)
-
-  def jac_site(  # pyright: ignore[reportIncompatibleMethodOverride]  # name-based allocating wrapper
-    self, name: str, ids: Any = None
-  ) -> tuple[np.ndarray, np.ndarray]:
-    """World-frame position/rotation Jacobians of a site, per selected simulation.
-
-    Returns (jacp, jacr) with shape (nsel, 3, nv). Runs kinematics and comPos
-    only, not mj_forward, and does not refresh the bound views."""
-    i = self.model.site(name).id
-    n = self._nsel(ids)
-    jacp = np.zeros((n, 3, self.model.nv))
-    jacr = np.zeros((n, 3, self.model.nv))
-    super().jac_site(i, jacp, jacr, ids)
-    return jacp, jacr
 
   def sample_hfield(  # pyright: ignore[reportIncompatibleMethodOverride]  # name-based allocating wrapper
     self,

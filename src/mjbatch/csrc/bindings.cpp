@@ -30,19 +30,23 @@ outside mjtState.
 bind("state") returns the (N, nstate) integration states themselves, in
 mj_getState's mjSTATE_INTEGRATION order: opaque rows for copying, saving and
 restoring simulations, native dtype only. A row written is the simulation's
-state at its next call, with pending field writes applied on top; the field
-views are stale until then. reset discards it, as it discards a field write.
+state at its next call, with pending writes to copied fields (below) applied on
+top. reset applies it element by element where it changed, like a field write.
 
 bind(field) returns an (N, ...) array over an mjData field in MjData's layout.
-Input fields (the mjtState components and warning) are copied in before
-a physics call, element by element, where they changed since we last wrote
-them; every bound field is copied out after, and a derived field bound between
-calls is filled for a simulation by its next call. reset applies pending writes
-after mj_resetData and then runs mj_forward, so derived fields are valid. After
-step, sensordata and every derived field are one substep behind qpos and qvel,
-as with mj_step itself, unless the batch was made with forward=True, which ends
-every step with mj_forward so they are current, at the cost of one forward per
-simulation per call.
+An mjtNum state component bound in its native dtype (qpos, qvel, ctrl,
+mocap_pos, ...) is a strided view into the state rows, so a write through it and
+a write to the row are one write, the later winning. The other input fields
+(eq_active, warning, and float32 bindings) are copies, copied in before a
+physics call, element by element, where they changed since we last wrote them;
+after a state write they are stale until the next call, and a write of the
+stale value goes unseen. Every bound field is copied out after a call, and a
+derived field bound between calls is filled for a simulation by its next call.
+reset applies pending writes after mj_resetData and then runs mj_forward, so
+derived fields are valid. After step, sensordata and every derived field are
+one substep behind qpos and qvel, as with mj_step itself, unless the batch was
+made with forward=True, which ends every step with mj_forward so they are
+current, at the cost of one forward per simulation per call.
 
 expand(field) returns (N, ...) per-simulation values of an mjModel field, seeded
 from the model and applied before every physics call for that simulation.
@@ -61,7 +65,12 @@ mj_setConst on one model. A MuJoCo error on a worker raises RuntimeError naming
 the first failing simulation; the others still ran, and the failing one keeps the
 state it had before the call, its writes still pending. Errors are trapped with a
 thread-local MuJoCo handler scoped to each worker call, so process-global handlers
-remain available to the application.)")
+remain available to the application.
+
+rays and jac are queries: mj_ray and mj_jac for each simulation against its own
+geometry, which is its state with pending writes on top and its expanded model
+fields. A query runs only the part of the pipeline it needs, consumes no pending
+write, and updates no bound field.)")
       .def(nb::init<nb::object, int, int, bool, std::optional<std::vector<int>>>(), "model"_a,
            "num_sims"_a, "num_threads"_a = 0, "forward"_a = false, "cpu_ids"_a = nb::none(),
            "num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends "
@@ -113,12 +122,6 @@ remain available to the application.)")
            "refresh_sensor_range(); columns outside every requested range are preserved.")
       .def("reset", &Batch::reset, "ids"_a.noconvert() = nb::none(), "keyframe"_a = -1,
            "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.")
-      .def("jac_site", &Batch::jac_site, "site"_a, "jacp"_a.noconvert() = nb::none(),
-           "jacr"_a.noconvert() = nb::none(), "ids"_a.noconvert() = nb::none(),
-           "mj_jacSite per selected simulation into caller-allocated (sel, 3, nv) rows; "
-           "either output may be None. Runs mj_kinematics and mj_comPos only, not "
-           "mj_forward, and does not refresh the bound views: the outputs are the "
-           "caller-allocated rows.")
       .def("sample_hfield", &Batch::sample_hfield, "geom"_a, "body"_a,
            "offsets"_a.noconvert(), "out"_a.noconvert(), "ids"_a.noconvert() = nb::none(),
            "alignment"_a = "world",
@@ -130,5 +133,22 @@ remain available to the application.)")
            "mj_kinematics only, not mj_forward, and does not refresh the bound views. All "
            "simulations sample the template's hfield; a per-sim geom_pos or geom_quat "
            "moves the sampling frame.")
-      .def("set_const", &Batch::set_const, "ids"_a.noconvert() = nb::none());
+      .def("set_const", &Batch::set_const, "ids"_a.noconvert() = nb::none())
+      .def("rays", &Batch::rays, "pnt"_a.noconvert(), "vec"_a.noconvert(), "dist"_a.noconvert(),
+           "geomid"_a.noconvert() = nb::none(), "normal"_a.noconvert() = nb::none(),
+           "geomgroup"_a.noconvert() = nb::none(), "flg_static"_a = true,
+           "bodyexclude"_a.noconvert() = nb::none(), "ids"_a.noconvert() = nb::none(),
+           "mj_ray for every ray of every simulation. pnt and vec are (num_sims, nray, 3) "
+           "origins and directions in the world frame, float32 or the native dtype. dist "
+           "(num_sims, nray), and the optional geomid (int32) and normal (num_sims, nray, 3), "
+           "are caller-allocated and filled in place: dist is -1 and normal zero where a ray "
+           "hits nothing. geomgroup is mj_ray's six-entry uint8 mask, bodyexclude one int32 "
+           "body id per ray (-1 for none), and ids restricts which rows are computed.")
+      .def("jac", &Batch::jac, "jacp"_a.noconvert(), "jacr"_a.noconvert(), "point"_a.noconvert(),
+           "body"_a.noconvert(), "ids"_a.noconvert() = nb::none(),
+           "mj_jac for one point per simulation. point is (num_sims, 3) in the world frame, "
+           "float32 or the native dtype, and body (num_sims,) int32 is the body it moves with. "
+           "jacp and jacr are caller-allocated (num_sims, 3, nv) arrays filled in place with "
+           "the translational and rotational Jacobians; either may be None. ids restricts "
+           "which rows are computed.");
 }

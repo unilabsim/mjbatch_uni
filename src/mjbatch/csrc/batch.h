@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -162,6 +164,29 @@ inline bool IsInput(std::string_view name) {
   return false;
 }
 
+// The mjtState component a data field is stored as, or 0.
+inline int StateBit(std::string_view name) {
+  static constexpr std::pair<std::string_view, int> bits[] = {
+      {"time", mjSTATE_TIME},
+      {"qpos", mjSTATE_QPOS},
+      {"qvel", mjSTATE_QVEL},
+      {"act", mjSTATE_ACT},
+      {"history", mjSTATE_HISTORY},
+      {"qacc_warmstart", mjSTATE_WARMSTART},
+      {"ctrl", mjSTATE_CTRL},
+      {"qfrc_applied", mjSTATE_QFRC_APPLIED},
+      {"xfrc_applied", mjSTATE_XFRC_APPLIED},
+      {"eq_active", mjSTATE_EQ_ACTIVE},
+      {"mocap_pos", mjSTATE_MOCAP_POS},
+      {"mocap_quat", mjSTATE_MOCAP_QUAT},
+      {"userdata", mjSTATE_USERDATA},
+      {"plugin_state", mjSTATE_PLUGIN}};
+  for (auto [n, bit] : bits) {
+    if (name == n) return bit;
+  }
+  return 0;
+}
+
 inline bool IsAsset(std::string_view name) {
   for (std::string_view p : {"mesh_", "hfield_", "tex_", "skin_", "bvh_", "oct_"}) {
     if (name.substr(0, p.size()) == p) return true;
@@ -247,6 +272,7 @@ struct Slot {
   size_t row;  // bytes per sim
   std::unique_ptr<uint8_t[]> buf;
   std::unique_ptr<uint8_t[]> mirror;  // buf as last written by us; input data fields only
+  int offset = -1;  // into each state row when the view is the state itself (no buf)
 };
 
 inline void ToBuf(uint8_t* dst, const void* src, const Slot& s) {
@@ -308,12 +334,9 @@ struct Scalars {
 // BatchEnvPool.sample_hfield_height convention, which this op replaces.
 enum class HfieldAlign { World, Yaw };
 
-// Per-call context for the query ops (JacSite, SampleHfield): outputs are
-// caller-allocated arrays, one row per selected sim, like step's history.
+// Per-call context for the query ops (SampleHfield): outputs are caller-
+// allocated arrays, one row per selected sim, like step's history.
 struct QueryCtx {
-  int site = -1;              // JacSite: site id
-  mjtNum* jacp = nullptr;     // (sel, 3, nv) rows, either may be null
-  mjtNum* jacr = nullptr;
   int geom = -1, body = -1;   // SampleHfield: hfield geom id, frame body id
   const mjtNum* offsets = nullptr;  // (npoint, 2) grid-frame XY around the body origin
   int npoint = 0;
@@ -471,8 +494,8 @@ class Batch {
     Reset,
     RefreshSensor,
     SetConst,
-    JacSite,
-    SampleHfield
+    SampleHfield,
+    Query
   };
   using Ids = nb::ndarray<nb::ndim<1>, nb::c_contig>;
 
@@ -493,10 +516,12 @@ class Batch {
     for (int t = 0; t < pool_->size(); ++t) data_.push_back(mj_makeData(template_));
     nstate_ = mj_stateSize(template_, mjSTATE_INTEGRATION);
     states_.resize(static_cast<size_t>(num_sims) * nstate_);
+    written_.resize(states_.size());
     warnings_.resize(static_cast<size_t>(num_sims) * mjNWARNING);
     for (int i = 0; i < num_sims; ++i) {
       mj_getState(template_, data_[0], State(i), mjSTATE_INTEGRATION);
     }
+    written_ = states_;
   }
 
   ~Batch() {
@@ -525,6 +550,19 @@ class Batch {
     bool f32 = ParseDtype(f, dtype);
     for (auto& s : bound_) {
       if (s->info == &f) return Matching(*s, f32);
+    }
+    // An mjtNum state component is a strided view into the state rows, so a
+    // write through either lands in the same place and none can go stale.
+    if (int bit = StateBit(f.name); bit && f.elem == Elem::Num && !f32) {
+      auto s = std::make_unique<Slot>();
+      s->info = &f;
+      s->f32 = false;
+      s->offset = mj_stateSize(template_, mjSTATE_INTEGRATION & (bit - 1));
+      if (mj_stateSize(template_, bit) != f.nr * f.nc) {
+        throw std::runtime_error(std::string(f.name) + " does not match its state component");
+      }
+      bound_.push_back(std::move(s));
+      return View(*bound_.back());
     }
     return View(BoundOrAdd(f, f32));
   }
@@ -639,25 +677,6 @@ class Batch {
     if (!error_.empty()) throw std::runtime_error(error_);
   }
 
-  // mj_jacSite per selected sim into caller-allocated (sel, 3, nv) rows; either
-  // output may be omitted. Runs kinematics and comPos only, not mj_forward, and
-  // does not refresh the bound views: the outputs are the caller-allocated rows.
-  void jac_site(int site, std::optional<nb::ndarray<>> jacp,
-                std::optional<nb::ndarray<>> jacr, std::optional<Ids> ids) {
-    ReentryGuard();
-    if (site < 0 || site >= template_->nsite) throw nb::value_error("site out of range");
-    auto sel = Parse(ids);
-    int nsel = sel ? static_cast<int>(sel->size()) : num_sims_;
-    QueryCtx ctx;
-    ctx.site = site;
-    ctx.jacp = jacp ? OutPtr(*jacp, nsel, 3, template_->nv, "jacp") : nullptr;
-    ctx.jacr = jacr ? OutPtr(*jacr, nsel, 3, template_->nv, "jacr") : nullptr;
-    if (!ctx.jacp && !ctx.jacr) {
-      throw nb::value_error("jacp and jacr cannot both be None");
-    }
-    Run(Op::JacSite, std::move(sel), 0, nullptr, &ctx);
-  }
-
   // Bilinear hfield sampling per selected sim at XY offsets around a frame
   // body's origin, into caller-allocated (sel, npoint) rows: the world z of
   // the sampled hfield surface. Runs kinematics only, not mj_forward, and does
@@ -692,7 +711,145 @@ class Batch {
     Run(Op::SampleHfield, std::move(sel), 0, nullptr, &ctx);
   }
 
+  // Queries read a sim's state with its pending writes on top, and its expanded model
+  // fields, and write nothing back. Each runs the part of the pipeline it needs.
+
+  // mj_ray for (N, R) rays given in the world frame.
+  void rays(nb::ndarray<> pnt, nb::ndarray<> vec, nb::ndarray<> dist,
+            std::optional<nb::ndarray<>> geomid, std::optional<nb::ndarray<>> normal,
+            std::optional<nb::ndarray<const uint8_t, nb::shape<mjNGROUP>, nb::c_contig>> geomgroup,
+            bool flg_static,
+            std::optional<nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig>> bodyexclude,
+            std::optional<Ids> ids) {
+    if (pnt.ndim() != 3) throw nb::value_error("pnt must have shape (num_sims, nray, 3)");
+    const size_t n = num_sims_, nray = pnt.shape(1);
+    const Elem real = RealOf(pnt);
+    const bool f32 = real == Elem::Float;
+    const void* origins = Array(pnt, "pnt", real, {n, nray, 3});
+    const void* directions = Array(vec, "vec", real, {n, nray, 3});
+    void* dists = Array(dist, "dist", real, {n, nray});
+    int* geomids =
+        geomid ? static_cast<int*>(Array(*geomid, "geomid", Elem::Int, {n, nray})) : nullptr;
+    void* normals = normal ? Array(*normal, "normal", real, {n, nray, 3}) : nullptr;
+    const mjtByte* group = geomgroup ? geomgroup->data() : nullptr;
+    if (bodyexclude && bodyexclude->shape(0) != nray) {
+      throw nb::value_error("bodyexclude must have nray entries");
+    }
+    const int* exclude = bodyexclude ? bodyexclude->data() : nullptr;
+    Query(ids, [=](const mjModel* m, mjData* d, int i) {
+      mj_kinematics(m, d);
+      if (m->nflex) mj_flex(m, d);
+      for (size_t k = 0; k < nray; ++k) {
+        const size_t at = i * nray + k;
+        mjtNum origin[3], direction[3], hit_normal[3];
+        for (int c = 0; c < 3; ++c) {
+          origin[c] = Get(origins, f32, 3 * at + c);
+          direction[c] = Get(directions, f32, 3 * at + c);
+        }
+        int hit = -1;
+        const mjtNum x = mj_ray(m, d, origin, direction, group, flg_static,
+                                exclude ? exclude[k] : -1, &hit, normals ? hit_normal : nullptr);
+        Put(dists, f32, at, x);
+        if (geomids) geomids[at] = hit;
+        for (int c = 0; normals && c < 3; ++c)
+          Put(normals, f32, 3 * at + c, x < 0 ? 0 : hit_normal[c]);
+      }
+    });
+  }
+
+  // mj_jac: the Jacobians of a world-frame point moving with a body.
+  void jac(std::optional<nb::ndarray<>> jacp, std::optional<nb::ndarray<>> jacr,
+           nb::ndarray<> point, nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig> body,
+           std::optional<Ids> ids) {
+    const size_t n = num_sims_, row = 3 * static_cast<size_t>(template_->nv);
+    const Elem real = RealOf(point);
+    const bool f32 = real == Elem::Float;
+    const void* points = Array(point, "point", real, {n, 3});
+    void* positional = jacp ? Array(*jacp, "jacp", real, {n, 3, row / 3}) : nullptr;
+    void* rotational = jacr ? Array(*jacr, "jacr", real, {n, 3, row / 3}) : nullptr;
+    if (body.shape(0) != n) throw nb::value_error("body must have num_sims entries");
+    const int* bodies = body.data();
+    for (size_t i = 0; i < n; ++i) {
+      if (bodies[i] < 0 || bodies[i] >= template_->nbody) {
+        throw nb::value_error("body ids must be in [0, nbody)");
+      }
+    }
+    Query(ids, [=](const mjModel* m, mjData* d, int i) {
+      mj_kinematics(m, d);
+      mj_comPos(m, d);
+      const mjtNum p[3] = {Get(points, f32, 3 * i), Get(points, f32, 3 * i + 1),
+                           Get(points, f32, 3 * i + 2)};
+      if (!f32) {
+        auto at = [=](void* a) { return a ? static_cast<mjtNum*>(a) + i * row : nullptr; };
+        mj_jac(m, d, at(positional), at(rotational), p, bodies[i]);
+        return;
+      }
+      mj_markStack(d);
+      mjtNum* jp = positional ? mj_stackAllocNum(d, row) : nullptr;
+      mjtNum* jr = rotational ? mj_stackAllocNum(d, row) : nullptr;
+      mj_jac(m, d, jp, jr, p, bodies[i]);
+      for (size_t k = 0; k < row; ++k) {
+        if (jp) Put(positional, true, i * row + k, jp[k]);
+        if (jr) Put(rotational, true, i * row + k, jr[k]);
+      }
+      mj_freeStack(d);
+    });
+  }
+
  private:
+  using QueryFn = std::function<void(const mjModel*, mjData*, int)>;
+
+  void Query(const std::optional<Ids>& ids, const QueryFn& fn) {
+    ReentryGuard();
+    auto sel = Parse(ids);
+    nb::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mu_);
+    error_.clear();
+    query_ = &fn;
+    RunLocked(Op::Query, sel, 0);
+    query_ = nullptr;
+    if (!error_.empty()) throw std::runtime_error(error_);
+  }
+
+  // float32 or mjtNum, whichever the array that sets a query's precision holds.
+  static Elem RealOf(const nb::ndarray<>& a) {
+    return a.dtype() == nb::dtype<float>() && sizeof(mjtNum) != sizeof(float) ? Elem::Float
+                                                                              : Elem::Num;
+  }
+
+  static void* Array(const nb::ndarray<>& a, const char* name, Elem elem,
+                     std::initializer_list<size_t> shape) {
+    const auto dtype = elem == Elem::Int     ? nb::dtype<int>()
+                       : elem == Elem::Float ? nb::dtype<float>()
+                                             : nb::dtype<mjtNum>();
+    bool ok = a.ndim() == shape.size() && a.dtype() == dtype &&
+              a.device_type() == nb::device::cpu::value && IsCContig(a);
+    std::string want;
+    size_t k = 0;
+    for (size_t extent : shape) {
+      ok = ok && a.shape(k++) == extent;
+      want += (want.empty() ? "" : ", ") + std::to_string(extent);
+    }
+    if (!ok) {
+      throw nb::value_error((std::string(name) + " must be a C-contiguous CPU " + DtypeName(elem) +
+                             " array of shape (" + want + ")")
+                                .c_str());
+    }
+    return a.data();
+  }
+
+  static mjtNum Get(const void* a, bool f32, size_t k) {
+    return f32 ? static_cast<const float*>(a)[k] : static_cast<const mjtNum*>(a)[k];
+  }
+
+  static void Put(void* a, bool f32, size_t k, mjtNum v) {
+    if (f32) {
+      static_cast<float*>(a)[k] = static_cast<float>(v);
+    } else {
+      static_cast<mjtNum*>(a)[k] = v;
+    }
+  }
+
   const FieldInfo& Field(const FieldTable& table, const std::string& name) {
     auto it = table.find(name);
     if (it == table.end()) {
@@ -840,6 +997,11 @@ class Batch {
     const FieldInfo& f = *s.info;
     size_t shape[3] = {static_cast<size_t>(num_sims_), static_cast<size_t>(f.nr),
                        static_cast<size_t>(f.nc)};
+    if (s.offset >= 0) {
+      int64_t strides[3] = {nstate_, f.ndim == 2 ? f.nc : 1, 1};
+      return nb::ndarray<nb::numpy>(states_.data() + s.offset, f.ndim + 1, shape, nb::find(this),
+                                    strides, nb::dtype<mjtNum>());
+    }
     nb::dlpack::dtype dt;
     if (s.f32 || f.elem == Elem::Float) {
       dt = nb::dtype<float>();
@@ -856,6 +1018,7 @@ class Batch {
   }
 
   void CopyOut(Slot& s, mjData* d, int i) {
+    if (s.offset >= 0) return;  // the state row itself
     uint8_t* row = s.buf.get() + i * s.row;
     ToBuf(row, s.info->get(d), s);
     if (s.mirror) std::memcpy(s.mirror.get() + i * s.row, row, s.row);
@@ -883,6 +1046,7 @@ class Batch {
   }
 
   mjtNum* State(int i) { return states_.data() + static_cast<size_t>(i) * nstate_; }
+  mjtNum* Written(int i) { return written_.data() + static_cast<size_t>(i) * nstate_; }
   mjWarningStat* Warning(int i) { return warnings_.data() + static_cast<size_t>(i) * mjNWARNING; }
 
   void RunSim(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
@@ -910,6 +1074,20 @@ class Batch {
         TrapCall(mj_resetDataKeyframe, m, d, arg);
       } else {
         TrapCall(mj_resetData, m, d);
+      }
+      // Pending writes to the state row, through it or an aliasing field view, land
+      // on top of the reset element by element, like pending field writes below.
+      const mjtNum* row = State(i);
+      const mjtNum* last = Written(i);
+      if (std::memcmp(row, last, nstate_ * sizeof(mjtNum)) != 0) {
+        mj_markStack(d);
+        mjtNum* merged = mj_stackAllocNum(d, nstate_);
+        mj_getState(m, d, merged, mjSTATE_INTEGRATION);
+        for (int k = 0; k < nstate_; ++k) {
+          if (std::memcmp(row + k, last + k, sizeof(mjtNum)) != 0) merged[k] = row[k];
+        }
+        mj_setState(m, d, merged, mjSTATE_INTEGRATION);
+        mj_freeStack(d);
       }
     } else {
       TrapCall(mj_setState, m, d, State(i), mjSTATE_INTEGRATION);
@@ -1009,24 +1187,20 @@ class Batch {
                           (*ctx->sensor_ranges)[j + 1] - (*ctx->sensor_ranges)[j]);
         }
         return;
-      // The query ops run kinematics only: they do not change the integration
-      // state, so the copy-out tail below is skipped. mjData is shared by every
-      // sim a worker serves, and copying out would leak another sim's stale
-      // derived fields into the bound views; the outputs are the
-      // caller-allocated rows.
-      case Op::JacSite:
-        TrapCall(mj_kinematics, m, d);
-        TrapCall(mj_comPos, m, d);
-        TrapCall(mj_jacSite, m, d, ctx->jacp, ctx->jacr, ctx->site);
-        return;
+      // Queries do not change the integration state, so the copy-out tail
+      // below is skipped; their outputs are the caller-allocated rows.
       case Op::SampleHfield:
         TrapCall(mj_kinematics, m, d);
         SampleHfield(m, d, *ctx);
+        return;
+      case Op::Query:
+        (*query_)(m, d, i);
         return;
       case Op::SetConst:
         break;
     }
     TrapCall(mj_getState, m, d, State(i), mjSTATE_INTEGRATION);
+    std::memcpy(Written(i), State(i), nstate_ * sizeof(mjtNum));
     std::memcpy(Warning(i), d->warning, sizeof(d->warning));
     for (auto& s : bound_) CopyOut(*s, d, i);
   }
@@ -1135,8 +1309,6 @@ class Batch {
       const QueryCtx* c = nullptr;
       if (ctx) {
         row_ctx = *ctx;
-        if (row_ctx.jacp) row_ctx.jacp += static_cast<size_t>(j) * 3 * template_->nv;
-        if (row_ctx.jacr) row_ctx.jacr += static_cast<size_t>(j) * 3 * template_->nv;
         if (row_ctx.out) row_ctx.out += static_cast<size_t>(j) * row_ctx.npoint;
         c = &row_ctx;
       }
@@ -1145,11 +1317,7 @@ class Batch {
         return;
       }
     };
-    if (pool_->size() == 1) {
-      for (int j = 0; j < n; ++j) fn(0, j);
-    } else {
-      pool_->Run(n, fn);
-    }
+    pool_->Run(n, fn);
   }
 
   // One substep for every selected sim that has not run its copy-out tail yet.
@@ -1170,11 +1338,7 @@ class Batch {
       row.done = done + j;
       if (!Guarded(t, p ? p[j] : j, op, k, nullptr, nullptr, &row)) return;
     };
-    if (pool_->size() == 1) {
-      for (int j = 0; j < n; ++j) fn(0, j);
-    } else {
-      pool_->Run(n, fn);
-    }
+    pool_->Run(n, fn);
   }
 
   // A step with a Python control callback: the calling thread invokes the
@@ -1263,6 +1427,7 @@ class Batch {
   std::vector<mjModel*> models_;  // per worker, once anything is expanded
   int nstate_;
   std::vector<mjtNum> states_;           // per sim, mjSTATE_INTEGRATION
+  std::vector<mjtNum> written_;          // states_ as last written by us, for reset
   std::vector<mjWarningStat> warnings_;  // per sim
   std::vector<Scalars> scalars_;         // per sim
   std::vector<std::unique_ptr<Slot>> bound_;
@@ -1270,6 +1435,7 @@ class Batch {
   std::set<const FieldInfo*> expanded_set_;
   const Slot* enableflags_ = nullptr;   // scanned for mjENBL_SLEEP before every call
   std::set<const FieldInfo*> changed_;  // set_const outputs not yet expanded
+  const QueryFn* query_ = nullptr;      // the query in flight, for workers
   std::unique_ptr<ThreadPool> pool_;
   std::mutex mu_;          // serializes calls; held with the GIL released in Run
   std::mutex changed_mu_;  // changed_ and error_ from workers
