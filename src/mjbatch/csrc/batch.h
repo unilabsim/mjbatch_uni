@@ -327,95 +327,7 @@ struct Scalars {
   }
 };
 
-// SampleHfield grid alignment: offsets stay in world axes (World) or rotate
-// with the frame body's yaw about world z (Yaw).  This is the mujoco_uni
-// BatchEnvPool.sample_hfield_height convention, which this op replaces.
-enum class HfieldAlign { World, Yaw };
-
-// Per-call context for the query ops (JacSite, SampleHfield): outputs are
-// caller-allocated arrays, one row per selected sim, like step's history.
-struct QueryCtx {
-  int site = -1;              // JacSite: site id
-  mjtNum* jacp = nullptr;     // (sel, 3, nv) rows, either may be null
-  mjtNum* jacr = nullptr;
-  int geom = -1, body = -1;   // SampleHfield: hfield geom id, frame body id
-  const mjtNum* offsets = nullptr;  // (npoint, 2) grid-frame XY around the body origin
-  int npoint = 0;
-  HfieldAlign align = HfieldAlign::World;  // SampleHfield: sampling grid rotation
-  mjtNum* out = nullptr;      // (sel, npoint) rows
-  Slot* sensor = nullptr;     // RefreshSensor: bound sensordata slot
-  const std::vector<int>* sensor_ranges = nullptr;  // flattened (start, stop) pairs
-};
-
-// One substep of a callback-driven step (Op::Substep): the calling thread
-// dispatches substeps one at a time and runs the Python callback in between,
-// so a sim's state round-trips through its states_ row every substep.
-struct CallbackCtx {
-  int k = 0, nstep = 1;
-  mjtNum* hist = nullptr;   // (sel, nstep, nstate) row for this sim
-  uint8_t* done = nullptr;  // set when this selection row runs its copy-out tail
-  bool tail_only = false;   // exception cleanup: no mj_step, copy out where it stopped
-  Slot* sensor = nullptr;   // Substep1: bound sensordata slot receiving selected columns
-  int sensor_start = 0;
-  int sensor_width = 0;
-};
-
-// Bilinear sampling of one hfield geom at XY offsets from a frame body's origin.
-// The offsets form a sampling grid rotated per ctx.align: World keeps them in
-// world axes, Yaw rotates them by the frame body's yaw about world z (extracted
-// from xmat). Sample points are taken in the plane through the geom center,
-// then transformed into the geom's local frame (its pose comes from the sim's
-// mjData, so per-sim geom_pos/geom_quat apply); the hfield grid itself is the
-// model's, shared by all sims. The grid mapping and clamping match MuJoCo's
-// hfield contact convention for the XY extent [-size[0], size[0]] x
-// [-size[1], size[1]]. The output is the world z of the sampled surface point
-// (for an unrotated geom at the origin, the local elevation interp * size[2]).
-
-inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx) {
-  int hfield = m->geom_dataid[ctx.geom];
-  int nrow = m->hfield_nrow[hfield], ncol = m->hfield_ncol[hfield];
-  const mjtNum* hsize = m->hfield_size + static_cast<size_t>(4) * hfield;
-  const float* data = m->hfield_data + static_cast<size_t>(hfield) * nrow * ncol;
-  const mjtNum* gpos = d->geom_xpos + 3 * ctx.geom;
-  const mjtNum* gmat = d->geom_xmat + 9 * ctx.geom;
-  const mjtNum* bpos = d->xpos + 3 * ctx.body;
-  const mjtNum* bmat = d->xmat + 9 * ctx.body;
-  mjtNum cyaw = 1.0, syaw = 0.0;  // frame body yaw about world z, for HfieldAlign::Yaw
-  if (ctx.align == HfieldAlign::Yaw) {
-    // xmat is row-major world = R * body; the body x-axis in world is column 0.
-    cyaw = mju_cos(mju_atan2(bmat[3], bmat[0]));
-    syaw = mju_sin(mju_atan2(bmat[3], bmat[0]));
-  }
-  for (int k = 0; k < ctx.npoint; ++k) {
-    mjtNum ox = ctx.offsets[2 * k], oy = ctx.offsets[2 * k + 1];
-    mjtNum rx = ox, ry = oy;
-    if (ctx.align == HfieldAlign::Yaw) {
-      rx = cyaw * ox - syaw * oy;
-      ry = syaw * ox + cyaw * oy;
-    }
-    // Both alignments sample in the geom-center plane.
-    mjtNum wp[3] = {bpos[0] + rx, bpos[1] + ry, gpos[2]};
-    mjtNum rel[3], lp[3];
-    mju_sub3(rel, wp, gpos);
-    mju_mulMatTVec(lp, gmat, rel, 3, 3);
-    mjtNum fx = (lp[0] / hsize[0] + 1.0) * 0.5 * (ncol - 1);
-    mjtNum fy = (lp[1] / hsize[1] + 1.0) * 0.5 * (nrow - 1);
-    fx = std::min(std::max(fx, 0.0), ncol - 1.001);
-    fy = std::min(std::max(fy, 0.0), nrow - 1.001);
-    int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
-    mjtNum sx = fx - ix, sy = fy - iy;
-    int ix1 = std::min(ix + 1, ncol - 1), iy1 = std::min(iy + 1, nrow - 1);
-    mjtNum h = (1 - sx) * (1 - sy) * data[iy * ncol + ix] +
-               sx * (1 - sy) * data[iy * ncol + ix1] +
-               (1 - sx) * sy * data[iy1 * ncol + ix] +
-               sx * sy * data[iy1 * ncol + ix1];
-    h *= hsize[2];
-    // World z of the surface point above the sample: gpos + gmat @ (lp0, lp1, h).
-    ctx.out[k] = gpos[2] + gmat[6] * lp[0] + gmat[7] * lp[1] + gmat[8] * h;
-  }
-}
-
-// MuJoCo error handlers must not return. A thread-local handler and longjmp
+// SampleHfield grid alignment:ot return. A thread-local handler and longjmp
 // keep the unwind within the worker's C++ frame, matching the official Python
 // bindings, without changing handlers owned by other threads.
 inline thread_local std::jmp_buf tls_jmp_buf = {};
@@ -1206,11 +1118,7 @@ class Batch {
         return;
       }
     };
-    if (pool_->size() == 1) {
-      for (int j = 0; j < n; ++j) fn(0, j);
-    } else {
-      pool_->Run(n, fn);
-    }
+    pool_->Run(n, fn);
   }
 
   // One substep for every selected sim that has not run its copy-out tail yet.
@@ -1231,11 +1139,7 @@ class Batch {
       row.done = done + j;
       if (!Guarded(t, p ? p[j] : j, op, k, nullptr, nullptr, &row)) return;
     };
-    if (pool_->size() == 1) {
-      for (int j = 0; j < n; ++j) fn(0, j);
-    } else {
-      pool_->Run(n, fn);
-    }
+    pool_->Run(n, fn);
   }
 
   // A step with a Python control callback: the calling thread invokes the
