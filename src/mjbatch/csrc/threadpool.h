@@ -55,10 +55,8 @@ class ThreadPool {
     for (int t = 1; t < nthreads; ++t) {
       threads_.emplace_back([this, t] { Worker(t); });
     }
-    // With pins requested, block until every worker applied its affinity so a
-    // failure is final (and readable via PinError) before the owner proceeds.
     if (!cpu_ids_.empty()) {
-      while (started_.load(std::memory_order_acquire) < nthreads_) {
+      while (started_.load(std::memory_order_acquire) < nthreads_ - 1) {
         std::this_thread::yield();
       }
     }
@@ -134,11 +132,11 @@ class ThreadPool {
     uint64_t seen = 0;
     while (true) {
       const auto deadline = Clock::now() + kSpin;
-      while (epoch_.load(std::memory_order_acquire) == seen) {
+      while (epoch_.load(std::memory_order_acquire) == seen && !stop_.load()) {
         if (Clock::now() < deadline) continue;
         std::unique_lock<std::mutex> lock(mu_);
         sleeping_.fetch_add(1);
-        wake_.wait(lock, [this, seen] { return epoch_.load() != seen; });
+        wake_.wait(lock, [this, seen] { return epoch_.load() != seen || stop_.load(); });
         sleeping_.fetch_sub(1);
       }
       if (stop_.load()) return;

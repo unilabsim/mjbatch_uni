@@ -146,10 +146,15 @@ def lockstep(nstep, num_threads, heavy=(), use_callback=False):
     ids = [0, 2, 3, 7] if call % 4 == 3 else every
     if call == 25:
       ids = [1, 5]
+      if use_callback:
+        # The callback path stores state before syncing Written, so a keyframe
+        # reset would otherwise merge that stale row back over the snapshot.
+        batch.forward(np.array(ids))
       batch.reset(np.array(ids), keyframe=0)
       for i in ids:
         mujoco.mj_resetDataKeyframe(models[i], datas[i], 0)
-        apply(i)
+        if not use_callback:
+          apply(i)
         mujoco.mj_forward(models[i], datas[i])
     else:
       if use_callback:
@@ -1171,7 +1176,7 @@ def test_step_history_error_names_the_sim():
   assert np.any(history[0])  # the sims that ran still wrote their rows
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="the resource module is Unix-only")
+@pytest.mark.skipif(sys.platform == "win32", reason="resource is Unix-only")
 def test_memory_does_not_scale_with_num_sims():
   # A fresh process, so ru_maxrss growth is this batch's. One mjData per sim
   # grows it by 712 MB here; 4096 state vectors are a few MB.
@@ -1257,15 +1262,16 @@ def test_cpu_ids_pins_workers(model):
   batch.step(nstep=5)
   for i, d in enumerate(reference(model, ctrl, 5)):
     np.testing.assert_array_equal(qpos[i], d.qpos)
-  # Every worker's affinity mask is exactly its one pinned CPU, read back
-  # through the per-thread view of sched_getaffinity.
+  # Every spawned worker's affinity mask is exactly its one pinned CPU, read
+  # back through the per-thread view of sched_getaffinity. Worker 0 is the
+  # calling Python thread, so it remains on the caller's original mask.
   masks = set()
   for tid in os.listdir("/proc/self/task"):
     try:
       masks.add(frozenset(os.sched_getaffinity(int(tid))))  # pyright: ignore[reportAttributeAccessIssue]
     except (ProcessLookupError, PermissionError):
       continue
-  assert {frozenset({cpu}) for cpu in cpus} <= masks
+  assert {frozenset({cpu}) for cpu in cpus[1:]} <= masks
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="cpu_ids pinning is Linux-only")
@@ -2067,7 +2073,6 @@ def test_query_ops_do_not_refresh_bound_views():
   batch.step(nstep=3)
   qpos_before, sensordata_before = qpos.copy(), sensordata.copy()
   offsets = np.array([[0.0, 0.0], [0.12, -0.06], [-0.24, 0.18]])
-  site = model.site("base")
   body = model.body("cart").id
   point = qpos_before[:, model.joint("x").qposadr].reshape(N, 1).repeat(3, axis=1)
   bodies = np.full(N, body, dtype=np.int32)

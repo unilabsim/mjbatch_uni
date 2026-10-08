@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
+from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 import mujoco
 import numpy as np
 
-from mjbatch._bindings import Batch as _Batch
+if sys.platform == "win32":
+  # The extension links mujoco.dll, which lives in the mujoco package.
+  os.add_dll_directory(str(Path(mujoco.__file__).parent))
+
+from mjbatch._bindings import Batch as _Batch  # noqa: E402
 from mjbatch.groups import ModelAffineBatch as ModelAffineBatch
 from mjbatch.groups import TopologyGroup as TopologyGroup
 from mjbatch.model import ModelFieldSpec as ModelFieldSpec

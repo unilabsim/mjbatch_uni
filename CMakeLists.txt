@@ -17,45 +17,21 @@ execute_process(
   OUTPUT_VARIABLE MUJOCO_PKG_DIR
   COMMAND_ERROR_IS_FATAL ANY)
 if(WIN32)
-  set(MUJOCO_DLL "${MUJOCO_PKG_DIR}/mujoco.dll")
-  if(NOT EXISTS "${MUJOCO_DLL}")
-    message(FATAL_ERROR "Could not find mujoco.dll in ${MUJOCO_PKG_DIR}")
-  endif()
-
-  # The MuJoCo wheel exports the C API from mujoco.dll but does not ship an
-  # MSVC import library. Generate one at build time; it is not installed.
-  get_filename_component(MSVC_TOOL_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-  find_program(MSVC_LIB_EXECUTABLE NAMES lib HINTS "${MSVC_TOOL_BIN_DIR}")
-  if(NOT MSVC_LIB_EXECUTABLE)
-    message(FATAL_ERROR "Could not find MSVC lib.exe")
-  endif()
-  find_program(MSVC_DUMPBIN_EXECUTABLE NAMES dumpbin HINTS "${MSVC_TOOL_BIN_DIR}")
-  if(NOT MSVC_DUMPBIN_EXECUTABLE)
-    message(FATAL_ERROR "Could not find MSVC dumpbin.exe")
-  endif()
-
+  # The Windows wheel ships mujoco.dll without an import library, so make one from
+  # the DLL's export table.
   execute_process(
-    COMMAND "${MSVC_DUMPBIN_EXECUTABLE}" "/EXPORTS" "${MUJOCO_DLL}"
+    COMMAND "${CMAKE_LINKER}" /dump /exports "${MUJOCO_PKG_DIR}/mujoco.dll"
     OUTPUT_VARIABLE MUJOCO_EXPORTS
     COMMAND_ERROR_IS_FATAL ANY)
-  string(REGEX MATCHALL
-         " +[0-9]+ +[0-9A-Fa-f]+ +[0-9A-Fa-f]+ +([^ \r\n]+)"
-         MUJOCO_EXPORT_MATCHES "${MUJOCO_EXPORTS}")
-  if(NOT MUJOCO_EXPORT_MATCHES)
-    message(FATAL_ERROR "Could not parse exports from ${MUJOCO_DLL}")
-  endif()
-
-  set(MUJOCO_DEF_FILE "${CMAKE_CURRENT_BINARY_DIR}/mujoco.def")
-  file(WRITE "${MUJOCO_DEF_FILE}" "LIBRARY mujoco.dll\nEXPORTS\n")
-  foreach(export_match IN LISTS MUJOCO_EXPORT_MATCHES)
-    string(REGEX REPLACE ".* +([^ \r\n]+)$" "\\1" export_symbol "${export_match}")
-    file(APPEND "${MUJOCO_DEF_FILE}" "  ${export_symbol}\n")
-  endforeach()
-
+  string(REGEX MATCHALL "[0-9]+ +[0-9A-F]+ +[0-9A-F]+ +[A-Za-z_][A-Za-z0-9_]*"
+    MUJOCO_EXPORTS "${MUJOCO_EXPORTS}")
+  list(TRANSFORM MUJOCO_EXPORTS REPLACE "^.* " "")
+  list(JOIN MUJOCO_EXPORTS "\n" MUJOCO_EXPORTS)
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/mujoco.def" "EXPORTS\n${MUJOCO_EXPORTS}\n")
   set(MUJOCO_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/mujoco.lib")
   execute_process(
-    COMMAND "${MSVC_LIB_EXECUTABLE}" "/def:${MUJOCO_DEF_FILE}" "/machine:x64"
-            "/out:${MUJOCO_LIBRARY}"
+    COMMAND "${CMAKE_AR}" /nologo /machine:x64 /name:mujoco.dll
+      "/def:${CMAKE_CURRENT_BINARY_DIR}/mujoco.def" "/out:${MUJOCO_LIBRARY}"
     COMMAND_ERROR_IS_FATAL ANY)
 else()
   file(GLOB MUJOCO_LIBRARY "${MUJOCO_PKG_DIR}/libmujoco*${CMAKE_SHARED_LIBRARY_SUFFIX}*")
@@ -66,17 +42,16 @@ else()
 endif()
 
 nanobind_add_module(_bindings FREE_THREADED NOMINSIZE src/mjbatch/csrc/bindings.cpp)
-if(WIN32)
-  # Windows headers are nested one directory deeper than the Unix wheels.
-  target_include_directories(_bindings PRIVATE "${MUJOCO_PKG_DIR}/include/mujoco")
-else()
-  target_include_directories(_bindings PRIVATE "${MUJOCO_PKG_DIR}/include")
-endif()
+# The Windows wheel nests the headers one directory deeper.
+find_path(MUJOCO_INCLUDE_DIR mujoco/mujoco.h REQUIRED NO_DEFAULT_PATH
+  PATHS "${MUJOCO_PKG_DIR}/include" "${MUJOCO_PKG_DIR}/include/mujoco")
+target_include_directories(_bindings PRIVATE "${MUJOCO_INCLUDE_DIR}")
 target_link_libraries(_bindings PRIVATE "${MUJOCO_LIBRARY}")
 
 # Find libmujoco next to the installed extension, <site-packages>/mujoco. The
 # macOS wheel's install name is a framework path that does not exist, so point
-# our load command at the plain file name instead.
+# our load command at the plain file name instead. Windows has no rpath: the
+# package adds that directory to the DLL search path before importing us.
 if(APPLE)
   get_filename_component(MUJOCO_LIB_NAME "${MUJOCO_LIBRARY}" NAME)
   execute_process(COMMAND otool -D "${MUJOCO_LIBRARY}" OUTPUT_VARIABLE _otool)
