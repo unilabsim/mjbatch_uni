@@ -123,3 +123,47 @@ def test_variant_pack_fails_closed_on_body_bvh_topology_mismatch():
 
   with pytest.raises(ValueError, match="body broadphase BVH topology"):
     VariantPack.from_specs([make_spec(2), make_spec(1)])
+
+
+def test_body_bvh_alignment_accepts_equivalent_permuted_tree():
+  """Equivalent BVH child order is platform-dependent and must remain exact."""
+  from mjbatch.variants import _align_body_bvh_aabb, _snapshot_variant
+
+  def make_spec():
+    return mujoco.MjSpec.from_string(
+      """
+<mujoco>
+  <worldbody>
+    <body name="body">
+      <freejoint name="free"/>
+      <geom name="a" type="box" pos="-0.2 0 0" size="0.05 0.05 0.05" mass="1"/>
+      <geom name="b" type="box" pos="0.2 0 0" size="0.05 0.05 0.05" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    )
+
+  spec = make_spec()
+  model = spec.compile()
+  snapshot = _snapshot_variant(spec, model)
+  rows = int(model.body_bvhnum.sum())
+  body = model.body("body").id
+  adr = int(model.body_bvhadr[body])
+  assert adr == 0 and rows == 3
+
+  # Swap the two leaves while preserving the same unordered tree.  MuJoCo can
+  # produce this ordering difference across platforms when geom extents change.
+  left, right = int(model.bvh_child[adr, 0]), int(model.bvh_child[adr, 1])
+  permuted = _snapshot_variant(spec, model)
+  permuted.body_bvh_topology["bvh_child"][adr, 0] = right
+  permuted.body_bvh_topology["bvh_child"][adr, 1] = left
+  permuted.body_bvh_topology["bvh_nodeid"][adr + left] = model.bvh_nodeid[adr + right]
+  permuted.body_bvh_topology["bvh_nodeid"][adr + right] = model.bvh_nodeid[adr + left]
+  permuted.body_bvh_aabb[adr + left], permuted.body_bvh_aabb[adr + right] = (
+    snapshot.body_bvh_aabb[adr + right].copy(),
+    snapshot.body_bvh_aabb[adr + left].copy(),
+  )
+
+  aligned = _align_body_bvh_aabb([permuted], model, [np.arange(model.ngeom)])
+  np.testing.assert_array_equal(aligned[0], snapshot.body_bvh_aabb)
