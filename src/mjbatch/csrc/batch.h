@@ -194,6 +194,42 @@ inline bool IsAsset(std::string_view name) {
   return false;
 }
 
+// MuJoCo currently stores body broad-phase BVH rows first, followed by mesh
+// internal BVH rows. The body prefix is the only per-variant part: changing a
+// geom's analytic size changes its body BVH AABB, while mesh rows stay pooled
+// and are selected by geom_dataid. Reject any non-contiguous or unrecognized
+// layout instead of scattering into the wrong suffix.
+inline int BodyBvhRows(const mjModel* m) {
+  auto fail = [](const char* what) {
+    throw std::runtime_error(std::string("unexpected mjModel BVH layout: ") + what);
+  };
+  int rows = 0;
+  for (int i = 0; i < m->nbody; ++i) {
+    int adr = m->body_bvhadr[i], num = m->body_bvhnum[i];
+    if (num < 0) fail("negative body_bvhnum");
+    if (num == 0) {
+      if (adr != -1) fail("an empty body BVH must have address -1");
+      continue;
+    }
+    if (adr != rows) fail("body BVH rows are not contiguous and body-first");
+    rows += num;
+  }
+  if (rows > m->nbvhstatic) fail("body BVH rows exceed nbvhstatic");
+  int mesh_rows = rows;
+  for (int i = 0; i < m->nmesh; ++i) {
+    int adr = m->mesh_bvhadr[i], num = m->mesh_bvhnum[i];
+    if (num < 0) fail("negative mesh_bvhnum");
+    if (num == 0) {
+      if (adr != -1) fail("an empty mesh BVH must have address -1");
+      continue;
+    }
+    if (adr != mesh_rows) fail("mesh BVH rows are not contiguous after body rows");
+    mesh_rows += num;
+  }
+  if (mesh_rows != m->nbvhstatic) fail("nbvhstatic contains an unrecognized suffix");
+  return rows;
+}
+
 inline FieldTable DataFields(const mjModel* m) {
   FieldTable t;
 #undef MJ_M
@@ -245,6 +281,16 @@ inline FieldTable ModelFields(const mjModel* m) {
 #undef X
 #undef MJ_M
 #define MJ_M(n) n
+  // A synthetic view over exactly the body prefix of bvh_aabb. Unlike the full
+  // field, this prefix is mutable per simulation without expanding pooled mesh
+  // collision assets.
+  if (!t.emplace("body_bvh_aabb",
+                 FieldInfo{"body_bvh_aabb",
+                           [](void* o) -> void* { return static_cast<mjModel*>(o)->bvh_aabb; },
+                           BodyBvhRows(m), 6, 2, sizeof(mjtNum), Elem::Num, false, false})
+           .second) {
+    throw std::runtime_error("body_bvh_aabb collides with an mjModel field");
+  }
   // mjOption alongside the arrays, its scalars shaped like mjData's time. The two
   // namespaces are disjoint today; a collision would silently shadow an array field.
 #define XOPT(type, name, nr, ndim, getter)                                                         \

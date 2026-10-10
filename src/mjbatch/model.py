@@ -58,6 +58,41 @@ def _is_writable(name: str, dtype: np.dtype[Any]) -> bool:
   return "_rowadr" not in name and "_colind" not in name and "_rownnz" not in name and "_diag" not in name
 
 
+def _body_bvh_rows(model: mujoco.MjModel) -> int:
+  """Return the body-first prefix length after validating MuJoCo's BVH layout."""
+
+  rows = 0
+  for body in range(model.nbody):
+    adr, num = int(model.body_bvhadr[body]), int(model.body_bvhnum[body])
+    if num < 0:
+      raise ValueError("unexpected mjModel BVH layout: negative body_bvhnum")
+    if num == 0:
+      if adr != -1:
+        raise ValueError("unexpected mjModel BVH layout: an empty body BVH must have address -1")
+      continue
+    if adr != rows:
+      raise ValueError("unexpected mjModel BVH layout: body BVH rows are not contiguous and body-first")
+    rows += num
+  if rows > model.nbvhstatic:
+    raise ValueError("unexpected mjModel BVH layout: body BVH rows exceed nbvhstatic")
+
+  mesh_rows = rows
+  for mesh in range(model.nmesh):
+    adr, num = int(model.mesh_bvhadr[mesh]), int(model.mesh_bvhnum[mesh])
+    if num < 0:
+      raise ValueError("unexpected mjModel BVH layout: negative mesh_bvhnum")
+    if num == 0:
+      if adr != -1:
+        raise ValueError("unexpected mjModel BVH layout: an empty mesh BVH must have address -1")
+      continue
+    if adr != mesh_rows:
+      raise ValueError("unexpected mjModel BVH layout: mesh BVH rows are not contiguous after body rows")
+    mesh_rows += num
+  if mesh_rows != model.nbvhstatic:
+    raise ValueError("unexpected mjModel BVH layout: nbvhstatic contains an unrecognized suffix")
+  return rows
+
+
 def build_model_fields(model: mujoco.MjModel) -> Mapping[str, ModelFieldSpec]:
   """Build immutable metadata for the arrays and options accepted by ``expand``."""
   specs: dict[str, ModelFieldSpec] = {}
@@ -76,6 +111,17 @@ def build_model_fields(model: mujoco.MjModel) -> Mapping[str, ModelFieldSpec]:
       asset=asset,
       recompute=_RECOMPUTE_BY_FIELD.get(name, RecomputeLevel.NONE),
     )
+
+  if "body_bvh_aabb" in specs:
+    raise ValueError("body_bvh_aabb collides with an mjModel field")
+  specs["body_bvh_aabb"] = ModelFieldSpec(
+    name="body_bvh_aabb",
+    shape=(int(_body_bvh_rows(model)), 6),
+    dtype=np.dtype(np.float64),
+    writable=True,
+    asset=False,
+    recompute=RecomputeLevel.NONE,
+  )
 
   integer, floating = np.dtype(np.int32), np.dtype(np.float64)
   for name in dir(model.opt):

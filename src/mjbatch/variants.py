@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 import mujoco
 import numpy as np
 
+from mjbatch.model import _body_bvh_rows
+
 _GEOM_VARIANT_FIELDS = (
   "geom_type",
   "geom_contype",
@@ -121,10 +123,13 @@ class VariantPack:
   def from_specs(cls, specs: Sequence[mujoco.MjSpec]) -> "VariantPack":
     """Compile variants independently and merge their meshes into one model.
 
-    Variants must have the same named structural layout. A canonical variant may
-    contain optional mesh-geom slots that are absent in another variant; missing
-    slots are disabled with ``mjGEOM_NONE``, ``geom_dataid=-1``, and zero contact
-    bits. Non-mesh topology and parameters must not vary.
+    Variants must have the same named structural layout, geom slot set, and
+    body broad-phase topology.  A missing geom slot changes the body BVH
+    topology and is rejected fail-closed rather than silently reusing canonical
+    broad-phase bounds.  The body-broadphase prefix described by
+    ``body_bvhadr``, ``body_bvhnum``, ``bvh_child``, ``bvh_nodeid``, and
+    ``bvh_depth`` must align exactly so ``body_bvh_aabb`` rows can be scattered
+    without a fallback.  Non-mesh parameters must also not vary.
 
     Construction is streamed through :class:`VariantPackBuilder`: one variant is
     compiled at a time and only small compiler-derived rows are retained, so
@@ -217,6 +222,7 @@ class VariantPackBuilder:
     _validate_shared_parameters(snapshots, canonical, geom_maps)
     _validate_shared_options(snapshots, canonical)
     mesh_id_maps = _build_mesh_id_maps(snapshots, canonical, mesh_names_by_variant)
+    aligned_body_bvh = _align_body_bvh_aabb(snapshots, canonical, geom_maps)
 
     fields: dict[str, np.ndarray] = {}
     for name in _VARIANT_FIELDS:
@@ -242,6 +248,11 @@ class VariantPackBuilder:
       for reference_geom, canonical_geom in enumerate(geom_map):
         dataid = int(snapshot.fields["geom_dataid"][reference_geom])
         dataids[variant, canonical_geom] = mesh_ids.get(dataid, -1)
+
+    body_rows = int(canonical.body_bvhnum.sum())
+    body_bvh_aabb = np.stack(aligned_body_bvh)
+    assert body_bvh_aabb.shape == (len(snapshots), body_rows, 6)
+    fields["body_bvh_aabb"] = body_bvh_aabb
 
     for values in fields.values():
       values.flags.writeable = False
@@ -287,6 +298,8 @@ class _VariantSnapshot:
   layout: tuple[tuple[str, int], ...]
   entity_names: dict[str, list[str]]
   fields: dict[str, np.ndarray]
+  body_bvh_aabb: np.ndarray
+  body_bvh_topology: dict[str, np.ndarray]
   body_simple: np.ndarray
   shared: dict[str, np.ndarray]
   options: dict[str, Any]
@@ -297,6 +310,14 @@ class _VariantSnapshot:
 def _snapshot_variant(spec: mujoco.MjSpec, model: mujoco.MjModel) -> _VariantSnapshot:
   fields = {name: np.asarray(getattr(model, name)).copy() for name in _VARIANT_FIELDS}
   fields["geom_dataid"] = np.asarray(model.geom_dataid).copy()
+  body_bvh_rows = _body_bvh_rows(model)
+  body_bvh_topology = {
+    "body_bvhadr": np.asarray(model.body_bvhadr).copy(),
+    "body_bvhnum": np.asarray(model.body_bvhnum).copy(),
+    "bvh_child": np.asarray(model.bvh_child[:body_bvh_rows]).copy(),
+    "bvh_nodeid": np.asarray(model.bvh_nodeid[:body_bvh_rows]).copy(),
+    "bvh_depth": np.asarray(model.bvh_depth[:body_bvh_rows]).copy(),
+  }
   shared: dict[str, np.ndarray] = {}
   for name in dir(model):
     if (
@@ -328,6 +349,8 @@ def _snapshot_variant(spec: mujoco.MjSpec, model: mujoco.MjModel) -> _VariantSna
     layout=_layout(model),
     entity_names=entity_names,
     fields=fields,
+    body_bvh_aabb=np.asarray(model.bvh_aabb[:body_bvh_rows]).copy(),
+    body_bvh_topology=body_bvh_topology,
     body_simple=np.asarray(model.body_simple).copy(),
     shared=shared,
     options=options,
@@ -593,6 +616,114 @@ def _validate_shared_options(snapshots: Sequence[_VariantSnapshot], canonical: m
         continue
       if not same:
         raise ValueError(f"variant {variant} changes option {name}")
+
+
+def _align_body_bvh_aabb(
+  snapshots: Sequence[_VariantSnapshot],
+  canonical: mujoco.MjModel,
+  geom_maps: Sequence[np.ndarray],
+) -> list[np.ndarray]:
+  """Validate body-BVH topology and return AABBs in canonical node order.
+
+  MuJoCo's BVH constructor may emit the same unordered binary tree with children
+  in a different order, even for an unchanged named-geom layout.  A direct
+  element-wise comparison can therefore reject equivalent trees on one platform
+  while accepting them on another.  Compare tree signatures with variant geom ids
+  mapped through the named-geom layout, then permute each variant's AABB rows
+  onto the canonical node ordering.  Mesh-internal BVH rows are not part of this
+  prefix and remain pooled assets.
+  """
+
+  canonical_rows = _body_bvh_rows(canonical)
+  canonical_addresses = np.asarray(canonical.body_bvhadr)
+  canonical_counts = np.asarray(canonical.body_bvhnum)
+
+  def signature(
+    child: np.ndarray,
+    nodeid: np.ndarray,
+    index: int,
+    *,
+    canonical_index: bool,
+    geom_map: np.ndarray,
+  ) -> str:
+    if child[index, 0] < 0 and child[index, 1] < 0:
+      geom = int(nodeid[index])
+      if canonical_index:
+        geom = int(geom_map[geom])
+      return f"G{geom}"
+    left = signature(child, nodeid, int(child[index, 0]), canonical_index=canonical_index, geom_map=geom_map)
+    right = signature(child, nodeid, int(child[index, 1]), canonical_index=canonical_index, geom_map=geom_map)
+    return "N(" + ",".join(sorted((left, right))) + ")"
+
+  aligned: list[np.ndarray] = []
+  for variant, (snapshot, geom_map) in enumerate(zip(snapshots, geom_maps, strict=True)):
+    addresses = snapshot.body_bvh_topology["body_bvhadr"]
+    counts = snapshot.body_bvh_topology["body_bvhnum"]
+    if not np.array_equal(addresses, canonical_addresses) or not np.array_equal(counts, canonical_counts):
+      raise ValueError(
+        f"variant {variant} changes body broadphase BVH topology: "
+        "exact per-variant body_bvh_aabb scatter is unsupported"
+      )
+    if snapshot.body_bvh_aabb.shape != (canonical_rows, 6):
+      raise ValueError(
+        f"variant {variant} changes body broadphase BVH row count: "
+        "exact per-variant body_bvh_aabb scatter is unsupported"
+      )
+
+    values = np.asarray(snapshot.body_bvh_aabb).copy()
+    for body in range(canonical.nbody):
+      count = int(canonical_counts[body])
+      if count == 0:
+        continue
+      canonical_adr = int(canonical_addresses[body])
+      variant_adr = int(addresses[body])
+      canonical_child = canonical.bvh_child[canonical_adr : canonical_adr + count]
+      variant_child = snapshot.body_bvh_topology["bvh_child"][variant_adr : variant_adr + count]
+      canonical_leaves = canonical.bvh_nodeid[canonical_adr : canonical_adr + count]
+      variant_leaves = snapshot.body_bvh_topology["bvh_nodeid"][variant_adr : variant_adr + count]
+
+      canonical_signatures = {}
+      for index in range(count):
+        key = signature(
+          canonical_child,
+          canonical_leaves,
+          index,
+          canonical_index=True,
+          geom_map=geom_map,
+        )
+        canonical_signatures.setdefault(key, []).append(index)
+      variant_signatures = {}
+      for index in range(count):
+        key = signature(
+          variant_child,
+          variant_leaves,
+          index,
+          canonical_index=False,
+          geom_map=geom_map,
+        )
+        variant_signatures.setdefault(key, []).append(index)
+
+      # Leaf labels are unique geom ids, so equivalent subtrees have unique
+      # signatures.  Reject malformed duplicate signatures instead of choosing
+      # an arbitrary mapping.
+      if (
+        set(canonical_signatures) != set(variant_signatures)
+        or any(len(indices) != 1 for indices in canonical_signatures.values())
+        or any(len(indices) != 1 for indices in variant_signatures.values())
+      ):
+        raise ValueError(
+          f"variant {variant} changes body broadphase BVH topology: "
+          "exact per-variant body_bvh_aabb scatter is unsupported"
+        )
+
+      for key, canonical_indices in canonical_signatures.items():
+        canonical_index = canonical_indices[0]
+        variant_index = variant_signatures[key][0]
+        values[canonical_adr + canonical_index] = snapshot.body_bvh_aabb[variant_adr + variant_index]
+
+    aligned.append(values)
+
+  return aligned
 
 
 def _build_mesh_id_maps(

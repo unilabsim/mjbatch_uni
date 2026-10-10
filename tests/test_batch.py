@@ -267,13 +267,11 @@ def test_variant_pack_matches_independently_compiled_references(tmp_path):
   obj_path = tmp_path / "tetrahedron.obj"
   obj_path.write_text(TETRAHEDRON_OBJ)
 
-  def make_spec(scale_a: str, scale_b: str, *, include_b: bool = True):
+  def make_spec(scale_a: str, scale_b: str):
     meshes = f'<mesh name="a" file="{obj_path}" scale="{scale_a}"/>'
-    if include_b:
-      meshes += f'<mesh name="b" file="{obj_path}" scale="{scale_b}"/>'
+    meshes += f'<mesh name="b" file="{obj_path}" scale="{scale_b}"/>'
     geoms = '<geom name="a" type="mesh" mesh="a" mass="1"/>'
-    if include_b:
-      geoms += '<geom name="b" type="mesh" mesh="b" mass="1"/>'
+    geoms += '<geom name="b" type="mesh" mesh="b" mass="1"/>'
     return mujoco.MjSpec.from_string(
       f"""
 <mujoco>
@@ -292,23 +290,16 @@ def test_variant_pack_matches_independently_compiled_references(tmp_path):
 
   specs = [
     make_spec("1 1 1", "1 1 1"),
-    make_spec(".7 .8 1.2", ".9 .9 .9"),
-    make_spec(".5 .6 .7", "1 1 1", include_b=False),
+    make_spec(".8 .8 .8", ".9 .9 .9"),
+    make_spec(".6 1 1", ".9 .9 .9"),
   ]
   pack = VariantPack.from_specs(specs)
   assert pack.num_variants == 3
   assert pack.model.nmesh == 5
   assert pack.model.ngeom == 3
   dataids = pack.fields["geom_dataid"]
-  missing = pack.model.geom("b").id
   assert np.take(dataids, [1, 2, 4, 5, 7]).min() >= 0
   assert dataids[0, 0] == -1
-  assert dataids[2, missing] == -1
-  assert pack.fields["geom_type"][2, missing] == mujoco.mjtGeom.mjGEOM_NONE
-  assert pack.fields["geom_contype"][2, missing] == 0
-  assert pack.fields["geom_conaffinity"][2, missing] == 0
-  assert pack.fields["geom_size"][2, missing].shape == (3,)
-  np.testing.assert_array_equal(pack.fields["geom_size"][2, missing], 0.0)
 
   assignment = np.arange(N) % 3
   batch = Batch.from_variant_pack(pack, N, assignment, num_threads=3)
@@ -466,13 +457,11 @@ def _make_scaled_mesh_spec_factory(tmp_path):
   obj_path = tmp_path / "tetrahedron.obj"
   obj_path.write_text(TETRAHEDRON_OBJ)
 
-  def make_spec(scale_a: str, scale_b: str, *, include_b: bool = True):
+  def make_spec(scale_a: str, scale_b: str):
     meshes = f'<mesh name="a" file="{obj_path}" scale="{scale_a}"/>'
-    if include_b:
-      meshes += f'<mesh name="b" file="{obj_path}" scale="{scale_b}"/>'
+    meshes += f'<mesh name="b" file="{obj_path}" scale="{scale_b}"/>'
     geoms = '<geom name="a" type="mesh" mesh="a" mass="1"/>'
-    if include_b:
-      geoms += '<geom name="b" type="mesh" mesh="b" mass="1"/>'
+    geoms += '<geom name="b" type="mesh" mesh="b" mass="1"/>'
     return mujoco.MjSpec.from_string(
       f"""
 <mujoco>
@@ -489,10 +478,10 @@ def _make_scaled_mesh_spec_factory(tmp_path):
 """
     )
 
-  variants = [("1 1 1", "1 1 1", True), (".7 .8 1.2", ".9 .9 .9", True), (".5 .6 .7", "1 1 1", False)]
+  variants = [("1 1 1", "1 1 1"), (".8 .8 .8", ".9 .9 .9"), (".6 1 1", ".9 .9 .9")]
 
   def fresh_specs():
-    return [make_spec(a, b, include_b=include) for a, b, include in variants]
+    return [make_spec(a, b) for a, b in variants]
 
   return fresh_specs
 
