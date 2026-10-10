@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 import mujoco
 import numpy as np
 
+from mjbatch.model import _body_bvh_rows
+
 _GEOM_VARIANT_FIELDS = (
   "geom_type",
   "geom_contype",
@@ -32,6 +34,13 @@ _BODY_VARIANT_FIELDS = (
 _DOF_VARIANT_FIELDS = ("dof_M0", "dof_invweight0", "dof_length")
 _DIRECT_VARIANT_FIELDS = _BODY_VARIANT_FIELDS + _DOF_VARIANT_FIELDS
 _VARIANT_FIELDS = _GEOM_VARIANT_FIELDS + _DIRECT_VARIANT_FIELDS
+_BODY_BVH_TOPOLOGY_FIELDS = (
+  "body_bvhadr",
+  "body_bvhnum",
+  "bvh_child",
+  "bvh_nodeid",
+  "bvh_depth",
+)
 _ALLOWED_GEOM_FIELDS = frozenset(_GEOM_VARIANT_FIELDS) | {"geom_dataid"}
 _ALLOWED_BODY_FIELDS = frozenset(_BODY_VARIANT_FIELDS)
 _ALLOWED_DOF_FIELDS = frozenset(_DOF_VARIANT_FIELDS)
@@ -121,10 +130,13 @@ class VariantPack:
   def from_specs(cls, specs: Sequence[mujoco.MjSpec]) -> "VariantPack":
     """Compile variants independently and merge their meshes into one model.
 
-    Variants must have the same named structural layout. A canonical variant may
-    contain optional mesh-geom slots that are absent in another variant; missing
-    slots are disabled with ``mjGEOM_NONE``, ``geom_dataid=-1``, and zero contact
-    bits. Non-mesh topology and parameters must not vary.
+    Variants must have the same named structural layout, geom slot set, and
+    body broad-phase topology.  A missing geom slot changes the body BVH
+    topology and is rejected fail-closed rather than silently reusing canonical
+    broad-phase bounds.  The body-broadphase prefix described by
+    ``body_bvhadr``, ``body_bvhnum``, ``bvh_child``, ``bvh_nodeid``, and
+    ``bvh_depth`` must align exactly so ``body_bvh_aabb`` rows can be scattered
+    without a fallback.  Non-mesh parameters must also not vary.
 
     Construction is streamed through :class:`VariantPackBuilder`: one variant is
     compiled at a time and only small compiler-derived rows are retained, so
@@ -217,6 +229,7 @@ class VariantPackBuilder:
     _validate_shared_parameters(snapshots, canonical, geom_maps)
     _validate_shared_options(snapshots, canonical)
     mesh_id_maps = _build_mesh_id_maps(snapshots, canonical, mesh_names_by_variant)
+    _validate_body_bvh_topology(snapshots, canonical)
 
     fields: dict[str, np.ndarray] = {}
     for name in _VARIANT_FIELDS:
@@ -242,6 +255,12 @@ class VariantPackBuilder:
       for reference_geom, canonical_geom in enumerate(geom_map):
         dataid = int(snapshot.fields["geom_dataid"][reference_geom])
         dataids[variant, canonical_geom] = mesh_ids.get(dataid, -1)
+
+    body_rows = int(canonical.body_bvhnum.sum())
+    body_bvh_aabb = np.tile(canonical.bvh_aabb[:body_rows], (len(snapshots), 1, 1))
+    for variant, snapshot in enumerate(snapshots):
+      body_bvh_aabb[variant] = snapshot.body_bvh_aabb
+    fields["body_bvh_aabb"] = body_bvh_aabb
 
     for values in fields.values():
       values.flags.writeable = False
@@ -287,6 +306,8 @@ class _VariantSnapshot:
   layout: tuple[tuple[str, int], ...]
   entity_names: dict[str, list[str]]
   fields: dict[str, np.ndarray]
+  body_bvh_aabb: np.ndarray
+  body_bvh_topology: dict[str, np.ndarray]
   body_simple: np.ndarray
   shared: dict[str, np.ndarray]
   options: dict[str, Any]
@@ -297,6 +318,14 @@ class _VariantSnapshot:
 def _snapshot_variant(spec: mujoco.MjSpec, model: mujoco.MjModel) -> _VariantSnapshot:
   fields = {name: np.asarray(getattr(model, name)).copy() for name in _VARIANT_FIELDS}
   fields["geom_dataid"] = np.asarray(model.geom_dataid).copy()
+  body_bvh_rows = _body_bvh_rows(model)
+  body_bvh_topology = {
+    "body_bvhadr": np.asarray(model.body_bvhadr).copy(),
+    "body_bvhnum": np.asarray(model.body_bvhnum).copy(),
+    "bvh_child": np.asarray(model.bvh_child[:body_bvh_rows]).copy(),
+    "bvh_nodeid": np.asarray(model.bvh_nodeid[:body_bvh_rows]).copy(),
+    "bvh_depth": np.asarray(model.bvh_depth[:body_bvh_rows]).copy(),
+  }
   shared: dict[str, np.ndarray] = {}
   for name in dir(model):
     if (
@@ -328,6 +357,8 @@ def _snapshot_variant(spec: mujoco.MjSpec, model: mujoco.MjModel) -> _VariantSna
     layout=_layout(model),
     entity_names=entity_names,
     fields=fields,
+    body_bvh_aabb=np.asarray(model.bvh_aabb[:body_bvh_rows]).copy(),
+    body_bvh_topology=body_bvh_topology,
     body_simple=np.asarray(model.body_simple).copy(),
     shared=shared,
     options=options,
@@ -593,6 +624,31 @@ def _validate_shared_options(snapshots: Sequence[_VariantSnapshot], canonical: m
         continue
       if not same:
         raise ValueError(f"variant {variant} changes option {name}")
+
+
+def _validate_body_bvh_topology(snapshots: Sequence[_VariantSnapshot], canonical: mujoco.MjModel) -> None:
+  """Require exactly alignable body broad-phase trees across all variants."""
+
+  canonical_rows = _body_bvh_rows(canonical)
+  canonical_topology = {
+    "body_bvhadr": np.asarray(canonical.body_bvhadr).copy(),
+    "body_bvhnum": np.asarray(canonical.body_bvhnum).copy(),
+    "bvh_child": np.asarray(canonical.bvh_child[:canonical_rows]).copy(),
+    "bvh_nodeid": np.asarray(canonical.bvh_nodeid[:canonical_rows]).copy(),
+    "bvh_depth": np.asarray(canonical.bvh_depth[:canonical_rows]).copy(),
+  }
+  for variant, snapshot in enumerate(snapshots):
+    if snapshot.body_bvh_topology["body_bvhnum"].sum() != canonical_rows:
+      raise ValueError(
+        f"variant {variant} changes body broadphase BVH topology: "
+        "exact per-variant body_bvh_aabb scatter is unsupported"
+      )
+    for name in _BODY_BVH_TOPOLOGY_FIELDS:
+      if not np.array_equal(snapshot.body_bvh_topology[name], canonical_topology[name]):
+        raise ValueError(
+          f"variant {variant} changes body broadphase BVH topology field {name}: "
+          "exact per-variant body_bvh_aabb scatter is unsupported"
+        )
 
 
 def _build_mesh_id_maps(

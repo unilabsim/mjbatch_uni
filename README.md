@@ -81,8 +81,11 @@ with batch.model_update("body_mass", "geom_friction", ids=reset_envs):
 ```
 
 For mesh-only differences, `VariantPack.from_specs()` independently compiles each
-source spec, pools and deduplicates meshes, aligns named geom slots, disables missing
-optional slots, and scatters compiler-derived geometry and inertia fields.
+source spec, pools and deduplicates meshes, aligns named geom slots, and scatters
+compiler-derived geometry, inertia, and exact body broad-phase AABB fields.
+All variants must use the same geom slot set and body broad-phase topology; a
+missing slot changes that topology and is rejected fail-closed. Mesh-internal BVH
+assets remain pooled and are selected by each variant's `geom_dataid`.
 `Batch.from_variant_pack()` applies its fixed assignment and initial recompute.
 
 ```python
