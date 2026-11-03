@@ -33,13 +33,16 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = ["mujoco==3.11.0", "numpy"]
 
+[project.optional-dependencies]
+jax = ["jax"]
+
 [project.urls]
 Homepage = "https://github.com/unilabsim/mjbatch_uni"
 Repository = "https://github.com/unilabsim/mjbatch_uni"
 Issues = "https://github.com/unilabsim/mjbatch_uni/issues"
 
 [dependency-groups]
-dev = ["pytest", "ruff", "pyright", "nanobind>=2.2.0"]
+dev = ["pytest", "ruff", "pyright", "nanobind>=2.2.0", "jax"]
 examples = [
   "mediapy",
   "mujoco-menagerie>=2026.9.0; python_full_version >= '3.10.12'",

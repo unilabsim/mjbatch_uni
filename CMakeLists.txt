@@ -9,13 +9,16 @@ execute_process(
   OUTPUT_VARIABLE nanobind_ROOT)
 find_package(nanobind CONFIG REQUIRED)
 
-# Headers and libmujoco come from the installed mujoco wheel.
-execute_process(
-  COMMAND "${Python_EXECUTABLE}" -c
-    "import mujoco, pathlib; print(pathlib.Path(mujoco.__file__).parent)"
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  OUTPUT_VARIABLE MUJOCO_PKG_DIR
-  COMMAND_ERROR_IS_FATAL ANY)
+# Headers and libmujoco come from the installed wheel unless a custom package is explicit.
+set(MUJOCO_PKG_DIR "" CACHE PATH "MuJoCo package containing include/ and libmujoco")
+if(NOT MUJOCO_PKG_DIR)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+      "import mujoco, pathlib; print(pathlib.Path(mujoco.__file__).parent)"
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE MUJOCO_PKG_DIR
+    COMMAND_ERROR_IS_FATAL ANY)
+endif()
 if(WIN32)
   # The Windows wheel ships mujoco.dll without an import library, so make one from
   # the DLL's export table.
@@ -46,6 +49,9 @@ nanobind_add_module(_bindings FREE_THREADED NOMINSIZE src/mjbatch/csrc/bindings.
 find_path(MUJOCO_INCLUDE_DIR mujoco/mujoco.h REQUIRED NO_DEFAULT_PATH
   PATHS "${MUJOCO_PKG_DIR}/include" "${MUJOCO_PKG_DIR}/include/mujoco")
 target_include_directories(_bindings PRIVATE "${MUJOCO_INCLUDE_DIR}")
+if(EXISTS "${MUJOCO_INCLUDE_DIR}/mujoco/mjadjoint.h")
+  target_compile_definitions(_bindings PRIVATE MJBATCH_HAS_ADJOINT_HEADER=1)
+endif()
 target_link_libraries(_bindings PRIVATE "${MUJOCO_LIBRARY}")
 
 # Find libmujoco next to the installed extension, <site-packages>/mujoco. The

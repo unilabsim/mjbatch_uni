@@ -37,6 +37,8 @@
 
 #include "threadpool.h"
 
+struct mjAdjContext_;
+
 namespace nb = nanobind;
 
 // Every logical CPU: MuJoCo's small dense linear algebra stalls on latency, so a
@@ -344,6 +346,7 @@ struct QueryCtx {
   mjtNum* out = nullptr;      // (sel, npoint) rows
   Slot* sensor = nullptr;     // RefreshSensor: bound sensordata slot
   const std::vector<int>* sensor_ranges = nullptr;  // flattened (start, stop) pairs
+  StepVjpCtx* vjp = nullptr;
 };
 
 // One substep of a callback-driven step (Op::Substep): the calling thread
@@ -487,6 +490,7 @@ class Batch {
  public:
   enum class Op {
     Step,
+    StepVJP,
     Substep,   // callback-step recovery tail
     Substep1,  // split callback: mj_step1 and selected sensor copy-out
     Substep2,  // split callback: apply writes and mj_step2
@@ -514,6 +518,7 @@ class Batch {
     scalars_.assign(num_sims, Scalars::Of(template_));
     pool_ = MakePool(num_threads, num_sims, std::move(cpu_ids));
     for (int t = 0; t < pool_->size(); ++t) data_.push_back(mj_makeData(template_));
+    adjoints_.resize(pool_->size(), nullptr);
     nstate_ = mj_stateSize(template_, mjSTATE_INTEGRATION);
     states_.resize(static_cast<size_t>(num_sims) * nstate_);
     written_.resize(states_.size());
@@ -526,6 +531,9 @@ class Batch {
 
   ~Batch() {
     pool_.reset();
+#ifdef MJBATCH_HAS_ADJOINT_HEADER
+    for (mjAdjContext* ctx : adjoints_) mj_deleteAdjContext(ctx);
+#endif
     for (mjData* d : data_) mj_deleteData(d);
     for (mjModel* m : models_) mj_deleteModel(m);
     mj_deleteModel(template_);
@@ -612,6 +620,33 @@ class Batch {
   void forward(std::optional<Ids> ids) {
     ReentryGuard();
     Run(Op::Forward, Parse(ids), 0);
+  }
+
+  void step_vjp(const nb::ndarray<>& bar_qpos, const nb::ndarray<>& bar_qvel,
+                const nb::ndarray<>& grad_qpos, const nb::ndarray<>& grad_qvel,
+                std::optional<nb::ndarray<>> grad_ctrl, const nb::ndarray<>& status,
+                std::optional<Ids> ids) {
+#ifndef MJBATCH_HAS_ADJOINT_HEADER
+    throw std::runtime_error("mjbatch was built without the MuJoCo adjoint ABI");
+#else
+    ReentryGuard();
+    auto sel = Parse(ids);
+    StepVjpCtx vjp;
+    vjp.bar_qpos = OutPtr(bar_qpos, num_sims_, 1, template_->nv, "dbar_qpos");
+    vjp.bar_qvel = OutPtr(bar_qvel, num_sims_, 1, template_->nv, "dbar_qvel");
+    vjp.grad_qpos = OutPtr(grad_qpos, num_sims_, 1, template_->nv, "dbar_qpos_in");
+    vjp.grad_qvel = OutPtr(grad_qvel, num_sims_, 1, template_->nv, "dbar_qvel_in");
+    vjp.grad_ctrl = grad_ctrl ? OutPtr(*grad_ctrl, num_sims_, 1, template_->nu, "dbar_ctrl") : nullptr;
+    if (template_->nu && !vjp.grad_ctrl) throw nb::value_error("dbar_ctrl is required when nu > 0");
+    if (status.ndim() != 1 || static_cast<int>(status.shape(0)) != num_sims_ ||
+        status.dtype() != nb::dtype<int>() || !IsCContig(status)) {
+      throw nb::value_error("status must be a C-contiguous int32 array of shape (num_sims,)");
+    }
+    vjp.status = static_cast<int*>(status.data());
+    QueryCtx ctx;
+    ctx.vjp = &vjp;
+    Run(Op::StepVJP, std::move(sel), 0, nullptr, &ctx);
+#endif
   }
 
   void RefreshSensorRanges(std::optional<Ids> ids, const std::vector<int>& sensor_ranges) {
@@ -1101,6 +1136,54 @@ class Batch {
       }
     }
     switch (op) {
+      case Op::StepVJP: {
+#ifdef MJBATCH_HAS_ADJOINT_HEADER
+        StepVjpCtx& vjp = *ctx->vjp;
+        mjAdjContext*& adj = adjoints_[t];
+        if (!adj) {
+          adj = mj_makeAdjContext(m);
+          if (adj) {
+            int nconmax = m->nconmax > 0 ? m->nconmax : 16;
+            int njmax = m->njmax > 0 ? m->njmax : 160;
+            size_t nJ64 = static_cast<size_t>(njmax) * m->nv;
+            size_t block = std::max(static_cast<size_t>(m->nv) * m->nv,
+                                    static_cast<size_t>(njmax) * njmax);
+            size_t width = std::max(static_cast<size_t>(m->nv), static_cast<size_t>(njmax));
+            size_t nA64 = 2 * block + static_cast<size_t>(njmax) * njmax + 2 * width + njmax;
+            if (nJ64 > static_cast<size_t>(INT32_MAX) || nA64 > static_cast<size_t>(INT32_MAX)) {
+              vjp.status[i] = mjADJ_UNSUPPORTED;
+              return;
+            }
+            int rc = mj_reserveAdjContext(adj, nconmax, njmax, static_cast<int>(nJ64),
+                                          static_cast<int>(nA64));
+            if (rc != mjADJ_OK) {
+              vjp.status[i] = rc;
+              return;
+            }
+          }
+        }
+        if (!adj) {
+          vjp.status[i] = mjADJ_UNSUPPORTED;
+          return;
+        }
+        mjtNum start_time = d->time;
+        int rc = mjd_stepAdjoint(m, d, adj, vjp.bar_qpos + static_cast<size_t>(i) * m->nv,
+                                 vjp.bar_qvel + static_cast<size_t>(i) * m->nv,
+                                 vjp.grad_qpos + static_cast<size_t>(i) * m->nv,
+                                 vjp.grad_qvel + static_cast<size_t>(i) * m->nv,
+                                 vjp.grad_ctrl ? vjp.grad_ctrl + static_cast<size_t>(i) * m->nu : nullptr);
+        vjp.status[i] = rc;
+        if (rc == mjADJ_OK || rc == mjADJ_STOP_GRADIENT || d->time != start_time) {
+          mj_getState(m, d, State(i), mjSTATE_INTEGRATION);
+          std::memcpy(Written(i), State(i), nstate_ * sizeof(mjtNum));
+          std::memcpy(Warning(i), d->warning, sizeof(d->warning));
+          for (auto& s : bound_) CopyOut(*s, d, i);
+        }
+        return;
+#else
+        throw std::runtime_error("mjbatch was built without the MuJoCo adjoint ABI");
+#endif
+      }
       case Op::Step: {
         for (int k = 0; k < arg; ++k) {
           TrapCall(mj_step, m, d);
@@ -1425,6 +1508,7 @@ class Batch {
   std::vector<const FieldInfo*> restorable_;
   std::vector<mjData*> data_;     // per worker
   std::vector<mjModel*> models_;  // per worker, once anything is expanded
+  std::vector<mjAdjContext*> adjoints_;  // per worker, created on the first StepVJP call
   int nstate_;
   std::vector<mjtNum> states_;           // per sim, mjSTATE_INTEGRATION
   std::vector<mjtNum> written_;          // states_ as last written by us, for reset

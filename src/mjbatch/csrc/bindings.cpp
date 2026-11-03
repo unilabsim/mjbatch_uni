@@ -5,6 +5,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include "adjoint.h"
 #include "batch.h"
 
 namespace nb = nanobind;
@@ -18,6 +19,8 @@ NB_MODULE(_bindings, m) {
                              std::to_string(mjVERSION_HEADER) + " but " +
                              std::to_string(mj_version()) + " is installed");
   }
+  m.def("adjoint_info", &AdjointInfo,
+        "Return the loaded MuJoCo adjoint ABI version and capability bitfield.");
   nb::class_<Batch>(m, "Batch", R"(N MuJoCo simulations stepped on a C++ thread pool.
 
 The model is copied at construction; edit it before. Calls are serialized.
@@ -108,6 +111,13 @@ write, and updates no bound field.)")
            "so they affect the current substep. If the callback raises, state remains at "
            "the last completed substep; intermediate mjData is recovered on the next call.")
       .def("forward", &Batch::forward, "ids"_a.noconvert() = nb::none())
+      .def("step_vjp", &Batch::step_vjp, "dbar_qpos"_a.noconvert(), "dbar_qvel"_a.noconvert(),
+           "dbar_qpos_in"_a.noconvert(), "dbar_qvel_in"_a.noconvert(),
+           "dbar_ctrl"_a.noconvert() = nb::none(), "status"_a.noconvert(),
+           "ids"_a.noconvert() = nb::none(),
+           "Run one fused adjoint step per selected simulation on the C++ thread pool. "
+           "Cotangent and gradient rows use nv tangent coordinates. status receives one "
+           "mjtAdjointStatus per sim; only valid or committed rows write gradients and state.")
       .def("refresh_sensor_range", &Batch::refresh_sensor_range, "ids"_a.noconvert() = nb::none(),
            "sensor_range"_a,
            "Refresh position- and velocity-stage sensors in a half-open sensordata column "

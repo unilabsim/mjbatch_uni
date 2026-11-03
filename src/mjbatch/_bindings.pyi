@@ -1,8 +1,20 @@
 from collections.abc import Callable, Sequence
-from typing import Annotated
+from typing import Annotated, TypedDict
 
 import numpy
 from numpy.typing import NDArray
+
+
+class AdjointInfo(TypedDict):
+    available: bool
+    abi_version: int
+    capabilities: int
+    expected_abi_version: int
+    step_vjp_capability: int
+    backend: str
+
+
+def adjoint_info() -> AdjointInfo: ...
 
 
 class Batch:
@@ -89,6 +101,16 @@ class Batch:
         """
 
     def forward(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...
+    def step_vjp(
+        self,
+        dbar_qpos: Annotated[NDArray, dict(shape=(None, None), order='C')],
+        dbar_qvel: Annotated[NDArray, dict(shape=(None, None), order='C')],
+        dbar_qpos_in: Annotated[NDArray, dict(shape=(None, None), order='C')],
+        dbar_qvel_in: Annotated[NDArray, dict(shape=(None, None), order='C')],
+        dbar_ctrl: Annotated[NDArray, dict(shape=(None, None), order='C')] | None = None,
+        status: Annotated[NDArray, dict(shape=(None,), order='C')] = ...,
+        ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None,
+    ) -> None: ...
     def refresh_sensor_range(
         self,
         ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = ...,
