@@ -518,7 +518,9 @@ class Batch {
     scalars_.assign(num_sims, Scalars::Of(template_));
     pool_ = MakePool(num_threads, num_sims, std::move(cpu_ids));
     for (int t = 0; t < pool_->size(); ++t) data_.push_back(mj_makeData(template_));
+#ifdef MJBATCH_HAS_ADJOINT_HEADER
     adjoints_.resize(pool_->size(), nullptr);
+#endif
     nstate_ = mj_stateSize(template_, mjSTATE_INTEGRATION);
     states_.resize(static_cast<size_t>(num_sims) * nstate_);
     written_.resize(states_.size());
@@ -1143,8 +1145,8 @@ class Batch {
         if (!adj) {
           adj = mj_makeAdjContext(m);
           if (adj) {
-            int nconmax = m->nconmax > 0 ? m->nconmax : 16;
-            int njmax = m->njmax > 0 ? m->njmax : 160;
+            int nconmax = m->nconmax > 0 ? m->nconmax : 64;
+            int njmax = m->njmax > 0 ? m->njmax : 512;
             size_t nJ64 = static_cast<size_t>(njmax) * m->nv;
             size_t block = std::max(static_cast<size_t>(m->nv) * m->nv,
                                     static_cast<size_t>(njmax) * njmax);
@@ -1508,7 +1510,9 @@ class Batch {
   std::vector<const FieldInfo*> restorable_;
   std::vector<mjData*> data_;     // per worker
   std::vector<mjModel*> models_;  // per worker, once anything is expanded
+#ifdef MJBATCH_HAS_ADJOINT_HEADER
   std::vector<mjAdjContext*> adjoints_;  // per worker, created on the first StepVJP call
+#endif
   int nstate_;
   std::vector<mjtNum> states_;           // per sim, mjSTATE_INTEGRATION
   std::vector<mjtNum> written_;          // states_ as last written by us, for reset

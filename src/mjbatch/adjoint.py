@@ -38,7 +38,10 @@ def _raw_qpos_to_tangent(batch: "Batch", current: np.ndarray, cotangent: np.ndar
       result[:, vadr : vadr + 3] = cotangent[:, padr : padr + 3]
       padr += 3
       vadr += 3
-    if joint_type in (mujoco.mjtJoint.mjJNT_FREE, mujoco.mjtJoint.mjJNT_BALL):
+    # NOTE: use == instead of `in (enum, enum)` — with numpy 2.5.4 + mujoco 3.17
+    # pybind enums, `np.int32(0) in (mjJNT_FREE, mjJNT_BALL)` evaluates False,
+    # which would leave result slots unwritten (np.empty garbage).
+    if joint_type == mujoco.mjtJoint.mjJNT_FREE or joint_type == mujoco.mjtJoint.mjJNT_BALL:
       quaternion_slice = slice(padr, padr + 4)
       matrix = _quat_matrix(current[:, quaternion_slice])
       result[:, vadr : vadr + 3] = np.einsum("nij,ni->nj", matrix, cotangent[:, quaternion_slice])
@@ -57,7 +60,7 @@ def _tangent_to_raw_qpos(batch: "Batch", qpos: np.ndarray, cotangent: np.ndarray
       result[:, padr : padr + 3] = cotangent[:, vadr : vadr + 3]
       padr += 3
       vadr += 3
-    if joint_type in (mujoco.mjtJoint.mjJNT_FREE, mujoco.mjtJoint.mjJNT_BALL):
+    if joint_type == mujoco.mjtJoint.mjJNT_FREE or joint_type == mujoco.mjtJoint.mjJNT_BALL:
       quat = qpos[:, padr : padr + 4]
       norm = np.linalg.norm(quat, axis=1, keepdims=True)
       unit = quat / norm
