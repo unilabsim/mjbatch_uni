@@ -3,6 +3,7 @@ Interactive GUI viewer for MuJoCo.
 """
 from __future__ import annotations
 import abc as abc
+import argparse as argparse
 import atexit as atexit
 import contextlib as contextlib
 import glfw as glfw
@@ -18,7 +19,7 @@ import threading as threading
 import time as time
 import typing
 import weakref as weakref
-__all__: list[str] = ['CallbackType', 'Handle', 'KeyCallbackType', 'LoaderType', 'MAX_SYNC_MISALIGN', 'PERCENT_REALTIME', 'SIM_REFRESH_FRACTION', 'abc', 'atexit', 'contextlib', 'glfw', 'launch', 'launch_from_path', 'launch_passive', 'math', 'mujoco', 'np', 'os', 'queue', 'sys', 'threading', 'time', 'weakref']
+__all__: list[str] = ['CallbackType', 'Handle', 'KeyCallbackType', 'LoaderType', 'MAX_SYNC_MISALIGN', 'PERCENT_REALTIME', 'SIM_REFRESH_FRACTION', 'abc', 'argparse', 'atexit', 'contextlib', 'glfw', 'launch', 'launch_from_path', 'launch_passive', 'math', 'mujoco', 'np', 'os', 'queue', 'sys', 'threading', 'time', 'weakref']
 class Handle:
     """
     A handle for interacting with a MuJoCo viewer.
@@ -46,7 +47,7 @@ class Handle:
     def set_figures(self, viewports_figures: typing.Union[typing.Tuple[mujoco._structs.MjrRect, mujoco._structs.MjvFigure], typing.List[typing.Tuple[mujoco._structs.MjrRect, mujoco._structs.MjvFigure]]]):
         """
         Overlay figures on the viewer.
-        
+
         Args:
           viewports_figures: Single tuple or list of tuples of (viewport, figure)
             viewport: Rectangle defining position and size of the figure
@@ -55,7 +56,7 @@ class Handle:
     def set_images(self, viewports_images: typing.Union[typing.Tuple[mujoco._structs.MjrRect, numpy.ndarray], typing.List[typing.Tuple[mujoco._structs.MjrRect, numpy.ndarray]]]):
         """
         Overlay images on the viewer.
-        
+
         Args:
           viewports_images: Single tuple or list of tuples of (viewport, image)
             viewport: Rectangle defining position and size of the image
@@ -64,7 +65,7 @@ class Handle:
     def set_texts(self, texts: typing.Union[typing.Tuple[typing.Optional[int], typing.Optional[int], typing.Optional[str], typing.Optional[str]], typing.List[typing.Tuple[typing.Optional[int], typing.Optional[int], typing.Optional[str], typing.Optional[str]]]]):
         """
         Overlay text on the viewer.
-        
+
         Args:
           texts: Single tuple or list of tuples of (font, gridpos, text1, text2)
             font: Font style from mujoco.mjtFontScale

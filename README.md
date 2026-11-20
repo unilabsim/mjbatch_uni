@@ -7,7 +7,7 @@
 
 Features include:
 
-* C++ thread pool execution, with the GIL released;
+* MuJoCo 4.0.1's upstream `mjb_*` C++ thread-pool executor, with the GIL released;
 * Live array access to simulation state and controls across the batch, with `bind` for MjData fields;
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
 * Same-layout compiler-coherent mesh variants, with `VariantPack.from_specs()` and `Batch.from_variant_pack()`.
@@ -16,6 +16,12 @@ Features include:
 * Per-substep control from Python with `step(..., callback=...)`.
 * Opt-in split substeps with fresh position/velocity sensor views for body wrench control.
 * Optional per-worker CPU pinning on Linux, with `cpu_ids` binding pool worker `i` to `cpu_ids[i]`.
+
+The upstream executor owns stepping, state storage, model expansion, and per-simulation error
+isolation. This fork keeps its Python callback, variant/topology, transactional metadata, query,
+and CPU-pinning layers; it no longer links MuJoCo's private logging symbols. MuJoCo's engine
+thread pool (`mju_threadpool`) runs inside one simulation and does not combine with the batch
+thread pool, so do not enable both for the same workload.
 
 For example:
 
@@ -108,7 +114,14 @@ Reproducible cold-start, RSS, stepping, and model-field-update measurements:
 
 ```bash
 uv run python benchmarks/topology_groups.py --num-sims 512 --threads 4
+uv run python benchmarks/scaling.py examples/assets/cartpole.xml --compare-rollout
 ```
+
+`--compare-rollout` measures identical precomputed controls through the Python-callback path and
+upstream `rollout`. Rollout can replace a callback only when all controls are known in advance; it
+cannot run arbitrary Python logic between substeps. A pure-Python wrapper is also not yet
+equivalent: float32 views, changed-input merging, split callbacks, and CPU pinning still need the
+thin native compatibility layer.
 
 `sample_hfield` samples a shared heightfield at XY offsets around a body origin,
 returning the world z of the sampled surface. `alignment="yaw"` rotates the

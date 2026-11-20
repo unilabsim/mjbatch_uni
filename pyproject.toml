@@ -1,10 +1,10 @@
 [build-system]
-requires = ["scikit-build-core>=1.0", "nanobind>=2.2.0", "mujoco==3.11.0"]
+requires = ["scikit-build-core>=1.0", "nanobind>=2.2.0", "mujoco-core==4.0.1"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "mjbatch-uni"
-version = "0.2.5"
+version = "0.3.0"
 description = "A Python library for running thousands of MuJoCo simulations in parallel on CPU (unilabsim fork)."
 readme = "README.md"
 license = "Apache-2.0"
@@ -22,7 +22,6 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Operating System :: Microsoft :: Windows",
   "Programming Language :: C++",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -30,8 +29,8 @@ classifiers = [
   "Programming Language :: Python :: Free Threading :: 2 - Beta",
   "Topic :: Scientific/Engineering",
 ]
-requires-python = ">=3.10"
-dependencies = ["mujoco==3.11.0", "numpy"]
+requires-python = ">=3.11"
+dependencies = ["mujoco==4.0.1", "numpy"]
 
 [project.urls]
 Homepage = "https://github.com/unilabsim/mjbatch_uni"
@@ -42,7 +41,7 @@ Issues = "https://github.com/unilabsim/mjbatch_uni/issues"
 dev = ["pytest", "ruff", "pyright", "nanobind>=2.2.0"]
 examples = [
   "mediapy",
-  "mujoco-menagerie>=2026.9.0; python_full_version >= '3.10.12'",
+  "mujoco-menagerie>=2026.9.0",
   "torch==2.9.0",
 ]
 
@@ -65,7 +64,7 @@ src = ["src", "tests", "benchmarks", "examples"]
 select = ["E4", "E7", "E9", "F", "I", "B"]
 
 [tool.pyright]
-pythonVersion = "3.10"
+pythonVersion = "3.11"
 include = ["src", "tests"]
 extraPaths = ["examples", "lab"]
 stubPath = "typings"
@@ -79,16 +78,16 @@ extra-paths = ["typings"]
 testpaths = ["tests"]
 
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-* cp313-*"
+build = "cp311-* cp312-* cp313-* cp314-*"
 skip = "*-musllinux_* *-win32 *_i686"
 test-requires = "pytest"
 test-command = "pytest {project}/tests"
 
 [tool.cibuildwheel.linux]
-repair-wheel-command = "auditwheel repair --exclude libmujoco.so.3.11.0 -w {dest_dir} {wheel}"
+repair-wheel-command = "auditwheel repair --exclude libmujoco.so.4.0.1 -w {dest_dir} {wheel}"
 
 [tool.cibuildwheel.macos]
-repair-wheel-command = "delocate-wheel --ignore-missing-dependencies --exclude libmujoco.3.11.0.dylib --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
+repair-wheel-command = "delocate-wheel --ignore-missing-dependencies --exclude libmujoco.4.0.1.dylib --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
 
 [tool.uv.sources]
 # CUDA wheels built against the 12.8 driver on the Linux boxes; PyPI's default torch

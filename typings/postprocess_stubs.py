@@ -71,7 +71,7 @@ def patch_init() -> None:
   init = STUB_DIR / "__init__.pyi"
   out = []
   for line in init.read_text().splitlines():
-    if DROP_IMPORT.match(line.strip()) or PLATFORM_ONLY_DEF.match(line):
+    if DROP_IMPORT.match(line.strip()) or PLATFORM_ONLY_DEF.match(line) or line.strip() == "mujoco =":
       continue
     line = SYSTEM_DEFAULT.sub(r"\1", line)
     if line.startswith("__all__"):
@@ -90,7 +90,7 @@ def sanitize_machine_specific() -> None:
       match = PATH_DEFAULT.match(line)
       if match:
         line = match.group(1)
-      out.append(line)
+      out.append(line.rstrip())
     path.write_text("\n".join(out) + "\n")
 
 

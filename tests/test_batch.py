@@ -98,7 +98,7 @@ LOCKSTEP_XML = """
   </keyframe>
 </mujoco>
 """
-COMPARED = ("qpos", "qvel", "act", "time", "sensordata", "site_xpos")
+COMPARED = ("qpos", "qvel", "act", "time", "sensordata", "site_xpos", "plastic")
 
 
 @pytest.fixture
@@ -183,6 +183,26 @@ def test_lockstep_with_mj_step(nstep, num_threads):
 @pytest.mark.parametrize("nstep", [1, 3])
 def test_lockstep_with_expanded_mass(nstep):
   lockstep(nstep, num_threads=4, heavy=(1, 2, 5))
+
+
+def test_plastic_state_lockstep():
+  xml = LOCKSTEP_XML.replace(
+    '<joint name="hinge" axis="0 1 0"/>',
+    '<joint name="hinge" axis="0 1 0" stiffness="1" springyield="0.1"/>',
+  )
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert model.nplastic > 0
+  batch = Batch(model, N, num_threads=3)
+  plastic, state = batch.bind("plastic"), batch.bind("state")
+  batch.step(nstep=25)
+  data = mujoco.MjData(model)
+  for _ in range(25):
+    mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(plastic, np.tile(data.plastic, (N, 1)))
+  expected = np.empty(batch.nstate)
+  mujoco.mj_getState(model, data, expected, mujoco.mjtState.mjSTATE_INTEGRATION)
+  np.testing.assert_array_equal(state, np.tile(expected, (N, 1)))
+  assert np.shares_memory(plastic, state)
 
 
 @pytest.mark.parametrize("num_threads", [1, 3])
@@ -1023,6 +1043,9 @@ def test_model_field_specs_describe_the_contract(model):
 
   assert specs["body_gravcomp"].recompute == RecomputeLevel.SET_CONST
   assert specs["qpos0"].recompute == RecomputeLevel.SET_CONST
+  assert specs["geom_size"].recompute == RecomputeLevel.SET_CONST
+  assert specs["jnt_axis"].recompute == RecomputeLevel.SET_CONST
+  assert specs["actuator_damping"].recompute == RecomputeLevel.SET_CONST
   assert specs["geom_friction"].recompute == RecomputeLevel.NONE
   assert specs["timestep"].shape == ()
   assert specs["timestep"].dtype == np.dtype(np.float64)
@@ -1731,9 +1754,9 @@ def test_rays_match_mj_ray(dtype, filtered):
   np.testing.assert_allclose(normal, want[2], atol=tol)
   hit = {model.geom(g).name for g in np.unique(geomid) if g >= 0}
   if filtered:
-    # MuJoCo 3.11 classifies mocap bodies as static for ray filtering, so the
-    # group-0 filter admits only the dynamic box; ball is group 1 and excluded.
-    assert hit == {"box"}
+    # MuJoCo 4.0 classifies mocap bodies as dynamic for ray filtering, so the
+    # group-0 filter admits the dynamic box and target; ball is group 1 and excluded.
+    assert hit == {"box", "target"}
   else:
     assert hit == {"floor", "hills", "wedge", "box", "ball", "target"}
 

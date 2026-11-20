@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15...3.30)
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
-find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python 3.11 COMPONENTS Interpreter Development.Module REQUIRED)
 
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
@@ -9,7 +9,7 @@ execute_process(
   OUTPUT_VARIABLE nanobind_ROOT)
 find_package(nanobind CONFIG REQUIRED)
 
-# Headers and libmujoco come from the installed mujoco wheel.
+# Headers and libmujoco come from the installed mujoco-core wheel.
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -c
     "import mujoco, pathlib; print(pathlib.Path(mujoco.__file__).parent)"

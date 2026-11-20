@@ -5,9 +5,12 @@ import numpy
 from numpy.typing import NDArray
 
 
+def _setconst_inputs() -> list[str]: ...
+
+
 class Batch:
     """
-    N MuJoCo simulations stepped on a C++ thread pool.
+    N MuJoCo simulations stepped on MuJoCo's mjb_* thread pool.
 
     The model is copied at construction; edit it before. Calls are serialized.
 
@@ -23,7 +26,7 @@ class Batch:
     top. reset applies it element by element where it changed, like a field write.
 
     bind(field) returns an (N, ...) array over an mjData field in MjData's layout.
-    An mjtNum state component bound in its native dtype (qpos, qvel, ctrl,
+    An mjtNum state component bound in its native dtype (qpos, qvel, ctrl, plastic,
     mocap_pos, ...) is a strided view into the state rows, so a write through it and
     a write to the row are one write, the later winning. The other input fields
     (eq_active, warning, and float32 bindings) are copies, copied in before a
@@ -52,8 +55,8 @@ class Batch:
     Derived constants follow expanded inputs only after set_const, as with
     mj_setConst on one model. A MuJoCo error on a worker raises RuntimeError naming
     the first failing simulation; the others still ran, and the failing one keeps the
-    state it had before the call, its writes still pending. The trap is a MuJoCo log
-    handler installed at import; installing another handler later disables it.
+    state it had before the call, its writes still pending. The upstream executor traps errors
+    per simulation without any private-symbol dependency in this extension.
 
     rays and jac are queries: mj_ray and mj_jac for each simulation against its own
     geometry, which is its state with pending writes on top and its expanded model
@@ -89,16 +92,16 @@ class Batch:
         """
 
     def forward(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...
-    def refresh_sensor_range(
-        self,
-        ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = ...,
-        sensor_range: Sequence[int] = ...,
-    ) -> None: ...
-    def refresh_sensor_ranges(
-        self,
-        ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = ...,
-        sensor_ranges: Sequence[int] = ...,
-    ) -> None: ...
+
+    def refresh_sensor_range(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, sensor_range: Sequence[int] | None = ...) -> None:
+        """
+        Refresh position- and velocity-stage sensors in a half-open sensordata column range from each selected simulation's final integration state. The work runs in native worker threads and only the declared columns are copied into the bound sensordata view; acceleration-stage sensors (including contact forces) and every other bound field are preserved.
+        """
+
+    def refresh_sensor_ranges(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, sensor_ranges: Sequence[int] | None = ...) -> None:
+        """
+        Refresh disjoint position- and velocity-stage sensor column ranges, expressed as a flattened sequence of half-open (start, stop) pairs. Semantics match refresh_sensor_range(); columns outside every requested range are preserved.
+        """
 
     def reset(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, keyframe: int = -1) -> None:
         """
