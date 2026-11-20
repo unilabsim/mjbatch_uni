@@ -10,15 +10,35 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
+namespace {
+
+nb::list SetConstInputs() {
+  nb::list inputs;
+#define X(name, fixed, kin0, inert0, spring)          \
+  {                                                   \
+    for (int group : {fixed, kin0, inert0, spring}) { \
+      if (!group) continue;                           \
+      if (group & mjSC_IN) inputs.append(#name);      \
+      break;                                          \
+    }                                                 \
+  }
+  MJSETCONST_ARRAYS
+#undef X
+  return inputs;
+}
+
+}  // namespace
+
 NB_MODULE(_bindings, m) {
   // Bound arrays keep their Batch alive by design, often until exit.
   nb::set_leak_warnings(false);
+  m.def("_setconst_inputs", &SetConstInputs);
   if (mj_version() != mjVERSION_HEADER) {
     throw std::runtime_error("mjbatch was built against MuJoCo " +
                              std::to_string(mjVERSION_HEADER) + " but " +
                              std::to_string(mj_version()) + " is installed");
   }
-  nb::class_<Batch>(m, "Batch", R"(N MuJoCo simulations stepped on a C++ thread pool.
+  nb::class_<Batch>(m, "Batch", R"(N MuJoCo simulations stepped on MuJoCo's mjb_* thread pool.
 
 The model is copied at construction; edit it before. Calls are serialized.
 
@@ -34,7 +54,7 @@ state at its next call, with pending writes to copied fields (below) applied on
 top. reset applies it element by element where it changed, like a field write.
 
 bind(field) returns an (N, ...) array over an mjData field in MjData's layout.
-An mjtNum state component bound in its native dtype (qpos, qvel, ctrl,
+An mjtNum state component bound in its native dtype (qpos, qvel, ctrl, plastic,
 mocap_pos, ...) is a strided view into the state rows, so a write through it and
 a write to the row are one write, the later winning. The other input fields
 (eq_active, warning, and float32 bindings) are copies, copied in before a
@@ -63,9 +83,8 @@ changed, so derived constants are per simulation too; mjModel scalars it writes
 Derived constants follow expanded inputs only after set_const, as with
 mj_setConst on one model. A MuJoCo error on a worker raises RuntimeError naming
 the first failing simulation; the others still ran, and the failing one keeps the
-state it had before the call, its writes still pending. Errors are trapped with a
-thread-local MuJoCo handler scoped to each worker call, so process-global handlers
-remain available to the application.
+state it had before the call, its writes still pending. The upstream executor traps errors
+per simulation without any private-symbol dependency in this extension.
 
 rays and jac are queries: mj_ray and mj_jac for each simulation against its own
 geometry, which is its state with pending writes on top and its expanded model
@@ -122,9 +141,8 @@ write, and updates no bound field.)")
            "refresh_sensor_range(); columns outside every requested range are preserved.")
       .def("reset", &Batch::reset, "ids"_a.noconvert() = nb::none(), "keyframe"_a = -1,
            "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.")
-      .def("sample_hfield", &Batch::sample_hfield, "geom"_a, "body"_a,
-           "offsets"_a.noconvert(), "out"_a.noconvert(), "ids"_a.noconvert() = nb::none(),
-           "alignment"_a = "world",
+      .def("sample_hfield", &Batch::sample_hfield, "geom"_a, "body"_a, "offsets"_a.noconvert(),
+           "out"_a.noconvert(), "ids"_a.noconvert() = nb::none(), "alignment"_a = "world",
            "Bilinear hfield sampling per selected simulation at XY offsets around a frame "
            "body's origin, into caller-allocated (sel, npoint) rows: the world z of the "
            "sampled hfield surface (the local elevation for an unrotated geom at the "

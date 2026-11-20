@@ -8,6 +8,8 @@ from typing import Any, Mapping
 import mujoco
 import numpy as np
 
+from mjbatch._bindings import _setconst_inputs
+
 
 class RecomputeLevel(IntEnum):
   """Whether a model-field write requires a stock-MuJoCo ``set_const`` pass."""
@@ -16,18 +18,7 @@ class RecomputeLevel(IntEnum):
   SET_CONST = 1
 
 
-_RECOMPUTE_BY_FIELD = {
-  "body_gravcomp": RecomputeLevel.SET_CONST,
-  "body_pos": RecomputeLevel.SET_CONST,
-  "body_quat": RecomputeLevel.SET_CONST,
-  "qpos0": RecomputeLevel.SET_CONST,
-  "dof_armature": RecomputeLevel.SET_CONST,
-  "tendon_armature": RecomputeLevel.SET_CONST,
-  "body_mass": RecomputeLevel.SET_CONST,
-  "body_ipos": RecomputeLevel.SET_CONST,
-  "body_inertia": RecomputeLevel.SET_CONST,
-  "body_iquat": RecomputeLevel.SET_CONST,
-}
+_SETCONST_INPUTS = frozenset(_setconst_inputs())
 
 _ASSET_PREFIXES = ("mesh_", "hfield_", "tex_", "skin_", "bvh_", "oct_")
 _WRITABLE_ID_SUFFIXES = ("dataid", "matid", "texid")
@@ -74,7 +65,7 @@ def build_model_fields(model: mujoco.MjModel) -> Mapping[str, ModelFieldSpec]:
       dtype=value.dtype,
       writable=not asset and _is_writable(name, value.dtype),
       asset=asset,
-      recompute=_RECOMPUTE_BY_FIELD.get(name, RecomputeLevel.NONE),
+      recompute=RecomputeLevel.SET_CONST if name in _SETCONST_INPUTS else RecomputeLevel.NONE,
     )
 
   integer, floating = np.dtype(np.int32), np.dtype(np.float64)

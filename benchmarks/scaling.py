@@ -16,6 +16,7 @@ import os
 import time
 
 import mujoco
+import mujoco.batch
 import numpy as np
 
 from mjbatch import Batch
@@ -45,6 +46,29 @@ def rate(batch: Batch, ctrl: np.ndarray, nstep: int, substeps: int) -> float:
   return substeps * batch.num_sims / (time.perf_counter() - t0)
 
 
+def callback_rate(batch: Batch, ctrl: np.ndarray, nstep: int, calls: int) -> float:
+  def apply_ctrl(k: int, state: np.ndarray, control: np.ndarray) -> None:
+    control[:] = ctrl[:, k]
+
+  for _ in range(2):
+    batch.step(nstep=nstep, callback=apply_ctrl)
+  t0 = time.perf_counter()
+  for _ in range(calls):
+    batch.step(nstep=nstep, callback=apply_ctrl)
+  return calls * nstep * batch.num_sims / (time.perf_counter() - t0)
+
+
+def rollout_rate(model: mujoco.MjModel, ctrl: np.ndarray, threads: int, calls: int) -> float:
+  nsim, nstep, _ = ctrl.shape
+  batch = mujoco.batch.Batch(model, nsim, threads)
+  for _ in range(2):
+    batch.rollout(nstep, control=ctrl, record=())
+  t0 = time.perf_counter()
+  for _ in range(calls):
+    batch.rollout(nstep, control=ctrl, record=())
+  return calls * nstep * nsim / (time.perf_counter() - t0)
+
+
 def main() -> None:
   p = argparse.ArgumentParser()
   p.add_argument("model")
@@ -52,6 +76,11 @@ def main() -> None:
   p.add_argument("--threads", default="1,2,4,8")
   p.add_argument("--keyframe", type=int, default=-1)
   p.add_argument("--assets", help="a Menagerie model whose assets the XML refers to")
+  p.add_argument(
+    "--compare-rollout",
+    action="store_true",
+    help="compare Python-callback steps with upstream rollout over identical precomputed controls",
+  )
   a = p.parse_args()
   if a.assets or not os.path.exists(a.model):
     import mujoco_menagerie
@@ -75,6 +104,15 @@ def main() -> None:
       f"  threads={threads:3d}  1 substep/call {one:10,.0f} ({one / base:4.1f}x)"
       f"  10/call {ten:10,.0f} sim-substeps/s"
     )
+    if a.compare_rollout:
+      nstep, calls = 10, 20
+      controls = np.random.default_rng(1).standard_normal((a.num_sims, nstep, model.nu)) * 0.3
+      callback = callback_rate(batch, controls, nstep, calls)
+      rollout = rollout_rate(model, controls, threads, calls)
+      print(
+        f"    callback {callback:10,.0f}  upstream rollout {rollout:10,.0f} sim-substeps/s"
+        f"  callback/rollout={callback / rollout:5.1%}"
+      )
 
 
 if __name__ == "__main__":
