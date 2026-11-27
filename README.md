@@ -75,7 +75,7 @@ other bound fields unchanged. Disjoint ranges can be refreshed in one dispatch w
 Rows are applied before each selected simulation runs. `model_field_specs()` describes
 the shape, dtype, writability, and recompute dependency of every field. Declare the
 fields being written to `model_update`; like mjlab event terms, mjbatch computes the
-strongest recompute level and runs one conservative stock-MuJoCo `mj_setConst` pass.
+strongest recompute level and runs one stock-MuJoCo `mj_setConst` pass on those simulations.
 
 ```python
 from mjbatch import RecomputeLevel
@@ -85,6 +85,12 @@ with batch.model_update("body_mass", "geom_friction", ids=reset_envs):
   batch.expand("body_mass")[reset_envs, body_id] *= 1.1
   batch.expand("geom_friction")[reset_envs, :, 0] = friction_samples
 ```
+
+`set_const(ids)` recomputes only the simulations in `ids` (`None`: all), and only the constants
+that read an expanded field, so its cost is in proportion to `len(ids)`: a field no constant
+reads, such as `geom_friction`, leaves a call with almost nothing to do. A derived field that
+is expanded for the first time is then computed for every simulation once, so none is left with
+constants that disagree with its inputs. The call builds no temporary batch.
 
 For mesh-only differences, `VariantPack.from_specs()` independently compiles each
 source spec, pools and deduplicates meshes, aligns named geom slots, disables missing
@@ -115,7 +121,12 @@ Reproducible cold-start, RSS, stepping, and model-field-update measurements:
 ```bash
 uv run python benchmarks/topology_groups.py --num-sims 512 --threads 4
 uv run python benchmarks/scaling.py examples/assets/cartpole.xml --compare-rollout
+uv run python benchmarks/set_const.py --check
 ```
+
+`set_const.py` is the reset path: it writes model fields on 1, 64, 1024 and every simulation and
+reports what each `set_const(ids)` costs in time, page faults and peak RSS, with and without a
+scene XML. `--check` fails the run if a steady-state call faults a page.
 
 `--compare-rollout` measures identical precomputed controls through the Python-callback path and
 upstream `rollout`. Rollout can replace a callback only when all controls are known in advance; it

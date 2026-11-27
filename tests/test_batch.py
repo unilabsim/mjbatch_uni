@@ -1502,6 +1502,283 @@ def test_set_const_subset_keeps_every_sim_consistent(model):
   np.testing.assert_array_equal(batch.expand("body_subtreemass")[:, pole], 5.0)
 
 
+def test_set_const_recomputes_only_the_selected_sims(model):
+  batch = Batch(model, N, num_threads=3)
+  pole = model.body("pole").id
+  mass = batch.expand("body_mass")
+  subtree = batch.expand("body_subtreemass")
+  mass[:, pole] = 2.0
+  batch.set_const()
+  np.testing.assert_array_equal(subtree[:, pole], 2.0)
+  # Once the derived fields are expanded, a call with ids recomputes those sims and leaves
+  # every other row as it is, derived constants included.
+  untouched = np.setdiff1d(np.arange(N), [1, 2, 3, 4, 5, 6])
+  subtree[5, pole] = 123.0
+  mass[[1, 4], pole] = 3.0
+  batch.set_const(np.array([1, 4]))
+  np.testing.assert_array_equal(subtree[[1, 4], pole], 3.0)
+  assert subtree[5, pole] == 123.0
+  np.testing.assert_array_equal(subtree[untouched, pole], 2.0)
+  mask = np.zeros(N, dtype=bool)
+  mask[[2, 6]] = True
+  mass[mask, pole] = 4.0
+  batch.set_const(mask)
+  np.testing.assert_array_equal(subtree[mask, pole], 4.0)
+  mass[3, pole] = 5.0
+  batch.set_const(np.array([3], dtype=np.int64))
+  assert subtree[3, pole] == 5.0
+  np.testing.assert_array_equal(subtree[untouched, pole], 2.0)
+  assert subtree[5, pole] == 123.0
+  np.testing.assert_array_equal(subtree[[1, 4], pole], 3.0)
+  before = subtree.copy()
+  batch.set_const(np.array([], dtype=np.int32))
+  np.testing.assert_array_equal(subtree, before)
+  # With no expanded field that a constant reads, a call computes nothing, and the rows of
+  # the sims it does not select keep whatever they hold.
+  quiet = Batch(model, N, num_threads=3)
+  quiet_subtree = quiet.expand("body_subtreemass")
+  quiet_subtree[5, pole] = 123.0
+  quiet.expand("geom_friction")[:, :, 0] = 0.9
+  quiet.set_const(np.array([0, 2]))
+  assert quiet_subtree[5, pole] == 123.0
+  np.testing.assert_array_equal(quiet_subtree[[0, 2], pole], model.body_subtreemass[pole])
+
+
+def reference_with_rows(model, batch, names, i):
+  """A copy of the model with simulation i's expanded rows applied, as mj_setConst leaves it."""
+  ref = copy.copy(model)
+  specs = batch.model_field_specs()
+  for name in names:
+    value = batch.expand(name)[i]
+    if hasattr(ref, name):
+      getattr(ref, name)[...] = value
+    elif specs[name].shape:
+      getattr(ref.opt, name)[...] = value
+    else:
+      setattr(ref.opt, name, value.item())
+  mujoco.mj_setConst(ref, mujoco.MjData(ref))
+  return ref
+
+
+def assert_writable_fields_match(batch, ref, i):
+  # every field expand accepts: mj_setConst's inputs, which the copy was given, and its outputs
+  for name, spec in batch.model_field_specs().items():
+    if not spec.writable:
+      continue
+    expected = getattr(ref, name) if hasattr(ref, name) else getattr(ref.opt, name)
+    np.testing.assert_array_equal(batch.expand(name)[i], np.asarray(expected), f"{name} sim {i}")
+
+
+def test_set_const_matches_a_model_copy_with_the_rows_applied(model):
+  batch = Batch(model, N, num_threads=3)
+  pole = model.body("pole").id
+  capsule = next(g for g in range(model.ngeom) if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_CAPSULE)
+  ids = np.array([0, 3, 4, 7])
+  batch.expand("body_mass")[ids, pole] = [0.05, 0.4, 0.2, 1.0]
+  batch.expand("body_gravcomp")[ids, pole] = 1.0
+  batch.expand("body_pos")[ids, 2] += [0, 0, 0.01]
+  batch.expand("body_quat")[ids, 2] = [0.9988, 0.05, 0, 0]
+  batch.expand("geom_size")[ids, capsule, :2] = [[0.03, 0.4], [0.02, 0.6], [0.05, 0.5], [0.01, 0.3]]
+  batch.expand("geom_pos")[ids, capsule] = [0, 0, 0.1]
+  batch.expand("geom_margin")[ids] = 0.002
+  batch.expand("dof_armature")[ids] = [0.01, 0.02, 0.03]
+  batch.expand("qpos0")[ids, 1] = [0.1, -0.2, 0.3, 0.05]
+  batch.expand("geom_friction")[ids, :, 0] = 0.8
+  batch.expand("timestep")[ids] = 0.0015
+  names = [
+    "body_mass",
+    "body_gravcomp",
+    "body_pos",
+    "body_quat",
+    "geom_size",
+    "geom_pos",
+    "geom_margin",
+    "dof_armature",
+    "qpos0",
+    "geom_friction",
+    "timestep",
+  ]
+  batch.set_const(ids)
+  for i in ids:
+    assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
+  batch.set_const()
+  for i in range(N):
+    assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
+
+
+MESH_BODY_XML = """
+<mujoco>
+  <option timestep="0.002"/>
+  <asset><mesh name="t" file="{obj}"/></asset>
+  <worldbody>
+    <geom type="plane" size="5 5 .1"/>
+    <body name="b" pos="0 0 .8" simple="false">
+      <joint name="h" type="hinge" axis="0 1 0"/>
+      <joint name="s" type="slide" axis="1 0 0"/>
+      <geom name="mesh" type="mesh" mesh="t" mass="1"/>
+      <geom name="box" type="box" size=".1 .05 .02" pos=".05 0 0"/>
+      <site name="s0" pos="0 .2 0"/>
+      <site name="s1" pos="0 -.2 0"/>
+    </body>
+    <body name="puck" pos="0 1 .5">
+      <joint type="slide" axis="0 0 1"/>
+      <geom type="sphere" size=".05" mass="1" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+  <tendon><spatial name="t"><site site="s0"/><site site="s1"/></spatial></tendon>
+  <actuator><motor joint="h"/><position joint="s" kp="2"/></actuator>
+</mujoco>
+"""
+
+
+def mesh_body_batch(tmp_path, num_threads=3):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+  model = mujoco.MjModel.from_xml_string(MESH_BODY_XML.format(obj=obj_path))
+  return model, Batch(model, N, num_threads=num_threads)
+
+
+def test_set_const_keeps_the_bounds_the_caller_gave_mesh_geoms(tmp_path):
+  # mj_setConst takes the bound of a mesh geom from its mesh, as compiled, so a per-sim mesh
+  # is chosen by writing geom_rbound: the call keeps it and computes dof_length from it, as a
+  # model of the simulation's own would, where the executor's pass alone would keep the
+  # template's.
+  model, batch = mesh_body_batch(tmp_path)
+  body = model.body("b").id
+  mesh_geom, box_geom = model.geom("mesh").id, model.geom("box").id
+  bounds = batch.expand("geom_rbound")
+  mass, inertia = batch.expand("body_mass"), batch.expand("body_iquat")
+  box_pos = batch.expand("geom_pos")
+  ids = np.array([1, 3, 6])
+  smaller = 0.5 * model.geom_rbound[mesh_geom]
+  bounds[ids, mesh_geom] = smaller
+  mass[ids, body] = 2.0
+  inertia[ids, body] = [0.9988, 0.05, 0, 0]
+  box_pos[ids, box_geom] = [0.08, 0.02, 0.01]
+  batch.set_const(ids)
+  np.testing.assert_array_equal(bounds[ids, mesh_geom], smaller)
+  np.testing.assert_array_equal(
+    bounds[np.setdiff1d(np.arange(N), ids), mesh_geom], model.geom_rbound[mesh_geom]
+  )
+  names = ["geom_rbound", "body_mass", "body_iquat", "geom_pos"]
+  length = batch.expand("dof_length")
+  for i in ids:
+    ref = reference_with_rows(model, batch, names, i)
+    assert_writable_fields_match(batch, ref, i)
+    np.testing.assert_array_equal(length[i], ref.dof_length)
+  # the bound is an input of dof_length: a pass that ignored it would leave the template's
+  assert np.all(length[ids, 0] != model.dof_length[0])
+  others = np.setdiff1d(np.arange(N), ids)
+  np.testing.assert_array_equal(length[others], np.tile(model.dof_length, (len(others), 1)))
+  batch.set_const()
+  for i in range(N):
+    assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
+
+
+def test_set_const_error_with_mesh_bounds_leaves_the_other_sims_exact(tmp_path):
+  model, batch = mesh_body_batch(tmp_path)
+  mesh_geom, puck = model.geom("mesh").id, model.body("puck").id
+  bounds = batch.expand("geom_rbound")
+  mass = batch.expand("body_mass")
+  bounds[:, mesh_geom] = 0.5 * model.geom_rbound[mesh_geom]
+  mass[[2, 5], puck] = [0.0, 2.0]  # sim 2's puck has no mass: mj_setConst raises for it
+  with pytest.raises(RuntimeError, match="sim 2"):
+    batch.set_const()
+  names = ["geom_rbound", "body_mass"]
+  sims = [i for i in range(N) if i != 2]
+  refs = []
+  for i in sims:
+    refs.append(reference_with_rows(model, batch, names, i))
+    assert_writable_fields_match(batch, refs[-1], i)
+  # The sims that ran step on the models the call left them, on every worker.
+  batch.bind("ctrl")[:, 1] = 0.3
+  batch.step(np.array(sims), nstep=20)
+  qpos, qvel = batch.bind("qpos"), batch.bind("qvel")
+  for i, ref in zip(sims, refs, strict=True):
+    data = mujoco.MjData(ref)
+    data.ctrl[1] = 0.3
+    for _ in range(20):
+      mujoco.mj_step(ref, data)
+    np.testing.assert_array_equal(qpos[i], data.qpos)
+    np.testing.assert_array_equal(qvel[i], data.qvel)
+  mass[2, puck] = 1.0
+  batch.set_const()
+  for i in range(N):
+    assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
+
+
+def test_set_const_with_float32_expanded_rows(model):
+  batch = Batch(model, N, num_threads=2)
+  pole = model.body("pole").id
+  ids = np.array([1, 4, 7])
+  untouched = np.setdiff1d(np.arange(N), ids)
+  mass = batch.expand("body_mass", np.float32)
+  mass[ids, pole] = np.float32(0.3)
+  batch.set_const(ids)
+  # The float32 row is the mass the derived constants were computed from.
+  np.testing.assert_array_equal(batch.expand("body_subtreemass")[ids, pole], np.float32(0.3))
+  # An output expanded as float32 shows what the call computed in float32 too.
+  shown = Batch(model, N, num_threads=2)
+  shown.expand("body_mass")[ids, pole] = np.float32(0.3)
+  subtree = shown.expand("body_subtreemass", np.float32)
+  shown.set_const(ids)
+  np.testing.assert_array_equal(subtree[ids, pole], np.float32(0.3))
+  np.testing.assert_array_equal(subtree[untouched, pole], np.float32(model.body_subtreemass[pole]))
+  batch.bind("ctrl")[:, 0] = 1.0
+  qvel = batch.bind("qvel")
+  batch.step(ids, nstep=20)
+  ref = copy.copy(model)
+  ref.body_mass[pole] = np.float32(0.3)
+  mujoco.mj_setConst(ref, mujoco.MjData(ref))
+  data = mujoco.MjData(ref)
+  data.ctrl[0] = 1.0
+  for _ in range(20):
+    mujoco.mj_step(ref, data)
+  np.testing.assert_array_equal(qvel[ids], np.tile(data.qvel, (len(ids), 1)))
+
+
+def chain_xml(links=29):
+  body = (
+    '<body name="b{i}" pos="0 0 -0.1"><joint type="hinge" axis="{a}"/>'
+    '<geom type="capsule" fromto="0 0 0 0 0 -0.1" size="0.03"/>'
+    '<geom type="sphere" pos="0 0.03 -0.05" size="0.03"/>'
+  )
+  opening = [body.format(i=i, a=["1 0 0", "0 1 0", "0 0 1"][i % 3]) for i in range(links)]
+  return (
+    '<mujoco><worldbody><geom name="floor" type="plane" size="0 0 0.05"/>'
+    '<body name="root" pos="0 0 1"><freejoint/>'
+    '<geom type="capsule" fromto="0 0 -0.2 0 0 0.2" size="0.08"/>'
+    + "".join(opening)
+    + "</body>" * links
+    + "</body></worldbody></mujoco>"
+  )
+
+
+def test_set_const_costs_no_temporary_memory():
+  # A call with ids used to rebuild a batch of every simulation; its pages came back as
+  # tens of thousands of faults per call here. macOS may report none for such allocations.
+  resource = pytest.importorskip("resource")
+  unit = 1.0 if sys.platform == "darwin" else 1024.0  # ru_maxrss: bytes on macOS, KiB elsewhere
+  num_sims = 4096
+  batch = Batch(mujoco.MjModel.from_xml_string(chain_xml()), num_sims, num_threads=4)
+  mass, friction = batch.expand("body_mass"), batch.expand("geom_friction")
+  ids = np.arange(64, dtype=np.int32)
+  peak0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+  batch.set_const()  # the one call that expands the derived fields
+  samples = []
+  for k in range(7):
+    mass[ids, 5] = 1.0 + 0.01 * k
+    friction[ids, :, 0] = 0.5 + 0.01 * k
+    before = resource.getrusage(resource.RUSAGE_SELF)
+    batch.set_const(ids)
+    after = resource.getrusage(resource.RUSAGE_SELF)
+    if k > 1:
+      samples.append(after.ru_minflt - before.ru_minflt)
+  assert max(samples) < 2000
+  peak = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - peak0) * unit
+  assert peak < 2**30
+
+
 def test_concurrent_calls_are_serialized(model):
   batch = Batch(model, N, num_threads=4)
   time = batch.bind("time")

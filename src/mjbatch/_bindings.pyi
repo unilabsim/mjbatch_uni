@@ -48,9 +48,14 @@ class Batch:
     need more arena than the template sized the worker's mjData for; that surfaces as
     the usual trapped MuJoCo error naming it. enableflags cannot turn sleep on, for
     the reason the constructor rejects it. The first call allocates one model copy
-    per thread. set_const runs mj_setConst per simulation and expands every field it
-    changed, so derived constants are per simulation too; mjModel scalars it writes
-    (flags, stat) are kept per simulation as well.
+    per thread. set_const runs mj_setConst on the selected simulations, on all of
+    them without ids, and only the groups of constants that read an expanded field.
+    Every field it changes becomes expanded, so derived constants are per simulation
+    too; the mjModel scalars it writes (flags, counts) are kept per simulation as
+    well. A field that becomes expanded is then computed for every simulation, so
+    none is left with constants that disagree with its inputs. Apart from that
+    one-time pass the call takes time in proportion to len(ids), and builds no
+    temporary batch.
 
     Derived constants follow expanded inputs only after set_const, as with
     mj_setConst on one model. A MuJoCo error on a worker raises RuntimeError naming
@@ -113,7 +118,10 @@ class Batch:
         Bilinear hfield sampling per selected simulation at XY offsets around a frame body's origin, into caller-allocated (sel, npoint) rows: the world z of the sampled hfield surface (the local elevation for an unrotated geom at the origin). alignment rotates the sampling grid: "world" keeps offsets in world axes, "yaw" rotates them by the frame body's yaw about world z. Runs mj_kinematics only, not mj_forward, and does not refresh the bound views. All simulations sample the template's hfield; a per-sim geom_pos or geom_quat moves the sampling frame.
         """
 
-    def set_const(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...
+    def set_const(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None:
+        """
+        mj_setConst per selected simulation, from its expanded fields; without ids, for all. Only the groups of constants that read an expanded field run, so an expanded field no constant depends on, such as geom_friction, leaves a call with almost nothing to do. mj_setConst takes the bound of a mesh or SDF geom from its mesh, as compiled: where geom_rbound is expanded, the call keeps the caller's value for those geoms and computes from it.
+        """
 
     def rays(self, pnt: NDArray, vec: NDArray, dist: NDArray, geomid: NDArray | None = None, normal: NDArray | None = None, geomgroup: Annotated[NDArray[numpy.uint8], dict(shape=(6), order='C', writable=False)] | None = None, flg_static: bool = True, bodyexclude: Annotated[NDArray[numpy.int32], dict(shape=(None,), order='C', writable=False)] | None = None, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None:
         """

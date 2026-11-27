@@ -143,7 +143,8 @@ class Batch(_Batch):
 
     This mirrors mjlab event terms: callers declare fields, and mjbatch computes the
     strongest recompute level from ``model_field_specs()``. A level above ``NONE``
-    currently uses one conservative full stock-MuJoCo ``mj_setConst`` pass.
+    currently calls ``set_const(ids)`` once: stock-MuJoCo ``mj_setConst`` on the selected
+    simulations, limited to the constants that read an expanded field.
     """
     ids_array = self._normalize_ids(ids)
     specs = self._model_fields
