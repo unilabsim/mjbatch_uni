@@ -92,6 +92,12 @@ reads, such as `geom_friction`, leaves a call with almost nothing to do. A deriv
 is expanded for the first time is then computed for every simulation once, so none is left with
 constants that disagree with its inputs. The call builds no temporary batch.
 
+`reset(ids)` costs time in proportion to `len(ids)` as well: only the selected rows are read, to
+keep what was written to their state since their last call. It ends with `mj_forward`, so derived
+fields are valid. A caller that writes state after the reset and runs `forward` itself passes
+`forward=False` and skips that forward, which leaves derived fields zero until the simulation's
+next call, as `mj_resetData` leaves them.
+
 For mesh-only differences, `VariantPack.from_specs()` independently compiles each
 source spec, pools and deduplicates meshes, aligns named geom slots, disables missing
 optional slots, and scatters compiler-derived geometry and inertia fields.
@@ -122,11 +128,13 @@ Reproducible cold-start, RSS, stepping, and model-field-update measurements:
 uv run python benchmarks/topology_groups.py --num-sims 512 --threads 4
 uv run python benchmarks/scaling.py examples/assets/cartpole.xml --compare-rollout
 uv run python benchmarks/set_const.py --check
+uv run python benchmarks/reset.py --num-sims 4096 16384 --check
 ```
 
 `set_const.py` is the reset path: it writes model fields on 1, 64, 1024 and every simulation and
 reports what each `set_const(ids)` costs in time, page faults and peak RSS, with and without a
-scene XML. `--check` fails the run if a steady-state call faults a page.
+scene XML. `--check` fails the run if a steady-state call faults a page. `reset.py` does the same
+for `reset(ids)` at several batch sizes, with and without the forward.
 
 `--compare-rollout` measures identical precomputed controls through the Python-callback path and
 upstream `rollout`. Rollout can replace a callback only when all controls are known in advance; it
