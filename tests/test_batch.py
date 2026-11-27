@@ -1866,6 +1866,62 @@ def test_set_const_error_with_mesh_bounds_leaves_the_other_sims_exact(tmp_path):
     assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
 
 
+def test_set_const_leaves_a_sleeping_sim_outside_the_selection_alone(tmp_path):
+  # A sleeping sim may not run, so the pass that computes a newly expanded field for every
+  # other sim skips it without an error; selecting it is rejected as for any other call.
+  model, batch = mesh_body_batch(tmp_path, num_threads=2)
+  body, mesh_geom = model.body("b").id, model.geom("mesh").id
+  batch.expand("enableflags")[3] |= int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+  bounds = batch.expand("geom_rbound")
+  ids = np.array([1, 4])
+  bounds[ids, mesh_geom] = 0.5 * model.geom_rbound[mesh_geom]
+  batch.expand("body_mass")[ids, body] = 2.0
+  batch.set_const(ids)
+  subtree = batch.expand("body_subtreemass")
+  np.testing.assert_array_equal(subtree[ids, body], 2.0)
+  assert subtree[3, body] == model.body_subtreemass[body]
+  with pytest.raises(ValueError, match="sim 3: sleep"):
+    batch.set_const()
+
+
+def test_set_const_with_mesh_bounds_from_batches_on_several_threads(tmp_path):
+  # The calling thread of a batch is also its last worker, so a thread runs corrective passes
+  # of several batches one after the other: what they write through is its own, per batch.
+  batches = [mesh_body_batch(tmp_path, num_threads=2) for _ in range(3)]
+  mismatches, completed = [], []
+
+  def work(k):
+    model, batch = batches[k]
+    rng = np.random.default_rng(k)
+    body, mesh_geom = model.body("b").id, model.geom("mesh").id
+    bounds, mass = batch.expand("geom_rbound"), batch.expand("body_mass")
+    for _ in range(6):
+      ids = np.sort(rng.choice(N, size=int(rng.integers(1, N)), replace=False))
+      rows = {}
+      for i in ids:
+        rows[i] = (model.geom_rbound.copy(), model.body_mass.copy())
+        rows[i][0][mesh_geom] = model.geom_rbound[mesh_geom] * rng.uniform(0.3, 1.0)
+        rows[i][1][body] = rng.uniform(0.5, 2.0)
+        bounds[i], mass[i] = rows[i]
+      batch.set_const(ids.astype(np.int32))
+      for i in ids:
+        ref = copy.copy(model)
+        ref.geom_rbound[...] = rows[i][0]
+        ref.body_mass[...] = rows[i][1]
+        mujoco.mj_setConst(ref, mujoco.MjData(ref))
+        for name in ("geom_rbound", "dof_length", "body_subtreemass", "body_invweight0"):
+          if not np.array_equal(batch.expand(name)[i], getattr(ref, name)):
+            mismatches.append((k, i, name))
+    completed.append(k)
+
+  threads = [threading.Thread(target=work, args=(k,)) for k in range(len(batches))]
+  for t in threads:
+    t.start()
+  for t in threads:
+    t.join()
+  assert sorted(completed) == list(range(len(batches))) and not mismatches
+
+
 def test_set_const_with_float32_expanded_rows(model):
   batch = Batch(model, N, num_threads=2)
   pole = model.body("pole").id
