@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -84,6 +85,7 @@ struct FieldInfo {
   Elem elem;
   bool input;
   bool asset;
+  void (*set)(void* obj, void* ptr) = nullptr;  // mjModel array fields: point the field at ptr
   size_t bytes() const { return static_cast<size_t>(nr) * nc * elem_size; }
 };
 
@@ -164,16 +166,18 @@ inline FieldTable ModelFields(const mjModel* m) {
   FieldTable t;
 #undef MJ_M
 #define MJ_M(n) (m->n)
-#define X(type, name, nr, nc)                                                           \
-  t[#name] = FieldInfo{#name,                                                           \
-                       [](void* o) -> void* { return static_cast<mjModel*>(o)->name; }, \
-                       static_cast<int>(MJ_M(nr)),                                      \
-                       static_cast<int>(nc),                                            \
-                       std::string_view(#nc) == "1" ? 1 : 2,                            \
-                       sizeof(type),                                                    \
-                       ElemOf<type>(),                                                  \
-                       false,                                                           \
-                       IsAsset(#name)};
+#define X(type, name, nr, nc)                                                    \
+  t[#name] =                                                                     \
+      FieldInfo{#name,                                                           \
+                [](void* o) -> void* { return static_cast<mjModel*>(o)->name; }, \
+                static_cast<int>(MJ_M(nr)),                                      \
+                static_cast<int>(nc),                                            \
+                std::string_view(#nc) == "1" ? 1 : 2,                            \
+                sizeof(type),                                                    \
+                ElemOf<type>(),                                                  \
+                false,                                                           \
+                IsAsset(#name),                                                  \
+                [](void* o, void* p) { static_cast<mjModel*>(o)->name = static_cast<type*>(p); }};
   MJMODEL_POINTERS
 #undef X
 #undef MJ_M
@@ -294,6 +298,15 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
 class Batch;
 inline thread_local const Batch* tls_callback = nullptr;
 
+// A worker's own copies of the mjModel arrays mj_setConst writes, and a model pointing at them.
+struct SetConstScratch {
+  const void* owner = nullptr;  // the Batch the buffer was sized for
+  size_t bytes = 0;
+  std::vector<uint8_t> buf;
+  mjModel model;
+};
+inline thread_local SetConstScratch tls_setconst;
+
 #ifdef __linux__
 struct PinCtx {
   std::atomic<int> arrived{0};
@@ -330,16 +343,6 @@ void PinWorker(const mjModel*, mjData*, int, void* arg) {
 #endif
 
 class Batch {
-  struct ConstOutput {
-    void* raw;
-    void* (*get)(void* obj);
-    size_t bytes;
-  };
-  struct ConstCtx {
-    Batch* self;
-    std::vector<ConstOutput>* outputs;
-  };
-
  public:
   using Ids = nb::ndarray<nb::ndim<1>, nb::c_contig>;
 
@@ -404,6 +407,28 @@ class Batch {
     }
     data_fields_ = DataFields(template_);
     model_fields_ = ModelFields(template_);
+    int nbvh = 0;  // bounding volumes of bodies, which mj_setConst refits, before the meshes'
+    for (int i = 0; i < template_->nbody; ++i) {
+      if (template_->body_bvhadr[i] >= 0) {
+        nbvh = std::max(nbvh, template_->body_bvhadr[i] + template_->body_bvhnum[i]);
+      }
+    }
+    size_t offset = 0;
+    for (auto& [name, f] : model_fields_) {
+      // an empty field never differs from the template, so mj_setConst never expands it
+      size_t bytes =
+          name == "bvh_aabb" ? 6 * static_cast<size_t>(nbvh) * sizeof(mjtNum) : f.bytes();
+      if (!bytes || !SetConstOutput(name)) continue;
+      out_fields_.push_back({&f, bytes, (offset + 7) & ~size_t(7)});
+      offset = out_fields_.back().offset + bytes;
+    }
+    out_bytes_ = offset;
+    for (int g = 0; g < template_->ngeom; ++g) {
+      // mj_setConst derives the bound of every geom but these, whose bound is their mesh's
+      if (template_->geom_type[g] == mjGEOM_MESH || template_->geom_type[g] == mjGEOM_SDF) {
+        mesh_geoms_.push_back(g);
+      }
+    }
     nstate_ = mjb_nstate(batch_);
     states_ = mjb_state(batch_);
     written_.resize(static_cast<size_t>(num_sims_) * nstate_);
@@ -554,6 +579,11 @@ class Batch {
     if (!error.empty()) throw std::runtime_error(error);
   }
 
+  // mj_setConst per selected sim from its expanded fields, on the upstream executor, which runs
+  // only the groups of constants that read an expanded field. Every field mj_setConst changes
+  // becomes expanded, so afterwards each sim steps with a complete set of its own derived
+  // constants. A newly expanded one starts from the template's value in every row, so the sims
+  // outside the selection are computed too, once per such field, to keep them all consistent.
   void set_const(std::optional<Ids> ids) {
     ReentryGuard();
     auto sel = Parse(ids);
@@ -561,89 +591,55 @@ class Batch {
     std::lock_guard<std::mutex> lock(mu_);
     if (expanded_.empty()) return;
     auto selected = Selected(sel);
-    auto all = Selected(std::nullopt);
+    if (selected.empty()) return;
     CheckSleep(selected);
-    PrepareExpanded(all);
-
-    struct Input {
-      std::string name;
-      size_t bytes;
-      std::vector<uint8_t> values;
-    };
-    std::vector<Input> inputs;
-    for (auto& s : expanded_) {
-      if (!SetConstInput(s->info->name)) continue;
-      std::string name =
-          IsOption(s->info->name) ? "opt." + std::string(s->info->name) : s->info->name;
-      inputs.push_back({name, s->native_row * num_sims_, {}});
-      inputs.back().values.resize(inputs.back().bytes);
-      std::memcpy(inputs.back().values.data(), s->raw, inputs.back().bytes);
-    }
-
-    std::unordered_map<std::string, std::vector<uint8_t>> previous;
-    for (auto& [name, f] : model_fields_) {
-      if (!SetConstOutput(name)) continue;
-      std::string qualified = IsOption(name) ? "opt." + name : name;
-      int size = 0, elemsize = 0;
-      const void* src = mjb_expanded(batch_, qualified.c_str(), &size, &elemsize);
-      if (!src) continue;
-      auto& values = previous[name];
-      values.resize(static_cast<size_t>(size) * elemsize * num_sims_);
-      std::memcpy(values.data(), src, values.size());
-    }
-
-    mjb_setConst(batch_, all.data(), num_sims_);
+    // The executor loads the rows of an expanded field only where mj_setConst reads it first,
+    // which the bounds of mesh geoms are not, although dof_length is computed from them: keep
+    // them across its pass, then compute once more with every expanded row loaded, as on a
+    // model of the simulation's own.
+    bool keep_bounds = rbound_ && !mesh_geoms_.empty();
     std::vector<uint8_t> failed(num_sims_, 0);
     std::string error;
-    RecordFailures(all, failed, error);
-
-    mjBatchConfig config;
-    mjb_defaultConfig(&config);
-    config.nthread = mjb_nthread(batch_);
-    char make_error[1024] = {};
-    mjBatch* computed =
-        mjb_makeBatch(template_, num_sims_, &config, make_error, sizeof(make_error));
-    if (!computed) throw std::runtime_error(make_error);
-    for (const auto& input : inputs) {
-      void* dst = mjb_expand(computed, input.name.c_str(), nullptr, nullptr);
-      if (dst) std::memcpy(dst, input.values.data(), input.bytes);
-    }
-    std::vector<ConstOutput> outputs;
-    for (auto& [name, f] : model_fields_) {
-      if (!SetConstOutput(name)) continue;
-      std::string qualified = IsOption(name) ? "opt." + name : name;
-      int size = 0, elemsize = 0;
-      void* raw = mjb_expand(computed, qualified.c_str(), &size, &elemsize);
-      auto old = previous.find(name);
-      if (raw && old != previous.end() &&
-          old->second.size() == static_cast<size_t>(size) * elemsize * num_sims_) {
-        std::memcpy(raw, old->second.data(), old->second.size());
+    bool again;
+    do {
+      again = false;  // a field became expanded, with the template's value outside the selection
+      PrepareExpanded(selected);
+      if (keep_bounds) CopyBounds(selected, true);
+      mjb_setConst(batch_, selected.data(), static_cast<int>(selected.size()));
+      RecordFailures(selected, failed, error);
+      for (OutField& f : out_fields_) {
+        int size = 0, elemsize = 0;
+        if (f.expanded) continue;
+        const uint8_t* row =
+            static_cast<const uint8_t*>(mjb_expanded(batch_, f.info->name, &size, &elemsize));
+        if (row && static_cast<size_t>(size) * elemsize == f.bytes) {
+          f.row = row;
+          f.expanded = true;
+          again = sel.has_value();
+        }
       }
-      if (raw) outputs.push_back({raw, f.get, static_cast<size_t>(size) * elemsize});
-    }
-    ConstCtx const_ctx{this, &outputs};
-    mjb_apply(computed, all.data(), num_sims_, SetConstFunc, &const_ctx, 0);
-    const int* computed_status = mjb_status(computed);
-    for (int i : all) {
-      if (error.empty() && computed_status[i]) {
-        error = "sim " + std::to_string(i) + ": " + mjb_error(computed, i);
+      if (keep_bounds) {
+        CopyBounds(selected, false);
+        SetConstCtx ctx{this};
+        ctx.changed.resize(out_fields_.size());
+        mjb_apply(batch_, selected.data(), static_cast<int>(selected.size()), SetConstApply, &ctx,
+                  0);
+        RecordFailures(selected, failed, error);
+        for (size_t k = 0; k < ctx.changed.size(); ++k) {
+          if (!ctx.changed[k]) continue;
+          OutField& f = out_fields_[k];
+          int size = 0, elemsize = 0;
+          f.row = static_cast<const uint8_t*>(mjb_expand(batch_, f.info->name, &size, &elemsize));
+          f.expanded = f.row != nullptr;
+          again = true;
+        }
       }
-    }
-    for (auto& [name, f] : model_fields_) {
-      if (!SetConstOutput(name)) continue;
-      std::string qualified = IsOption(name) ? "opt." + name : name;
-      int size = 0, elemsize = 0, dst_size = 0, dst_elemsize = 0;
-      const void* src = mjb_expanded(computed, qualified.c_str(), &size, &elemsize);
-      if (!src) continue;
-      void* dst = mjb_expand(batch_, qualified.c_str(), &dst_size, &dst_elemsize);
-      if (dst && size == dst_size && elemsize == dst_elemsize) {
-        std::memcpy(dst, src, static_cast<size_t>(size) * elemsize * num_sims_);
-      }
-    }
-    mjb_deleteBatch(computed);
+      if (!again) break;
+      selected = Awake();
+    } while (!selected.empty());
     for (auto& s : expanded_) {
-      if (s->f32) {
-        for (int i = 0; i < num_sims_; ++i) SyncOut(*s, i);
+      if (s->f32 && SetConstOutput(s->info->name)) {
+        for (int i : selected) SyncOut(*s, i);
       }
     }
     if (!error.empty()) throw std::runtime_error(error);
@@ -764,6 +760,20 @@ class Batch {
   using QueryFn = std::function<void(const mjModel*, mjData*, int)>;
   enum class ApplyOp { Substep1, Substep2, RefreshSensor, Hfield, Query };
 
+  // an mjModel array mj_setConst writes, which can differ from the template's
+  struct OutField {
+    const FieldInfo* info;
+    size_t bytes;   // per simulation; bvh_aabb: the bodies' bounding volumes only
+    size_t offset;  // in a worker's scratch buffer
+    bool expanded = false;
+    const uint8_t* row = nullptr;  // its per-simulation rows, once expanded
+  };
+  struct SetConstCtx {
+    Batch* self;
+    std::mutex mu;
+    std::vector<uint8_t> changed;  // per OutField: a sim's value differs from the template's
+  };
+
   struct ApplyCtx {
     Batch* self = nullptr;
     ApplyOp op;
@@ -774,19 +784,6 @@ class Batch {
     int sensor_width = 0;
     const QueryFn* fn = nullptr;
   };
-
-  static bool SetConstInput(std::string_view name) {
-#define X(field, fixed, kin0, inert0, spring)         \
-  if (name == #field) {                               \
-    for (int group : {fixed, kin0, inert0, spring}) { \
-      if (!group) continue;                           \
-      return (group & mjSC_IN) != 0;                  \
-    }                                                 \
-  }
-    MJSETCONST_ARRAYS
-#undef X
-    return false;
-  }
 
   static bool SetConstOutput(std::string_view name) {
 #define X(field, fixed, kin0, inert0, spring) \
@@ -887,6 +884,13 @@ class Batch {
     if (f32) AllocateConverted(*s, false);
     expanded_.push_back(std::move(s));
     Slot& out = *expanded_.back();
+    for (OutField& o : out_fields_) {
+      if (o.info == &f) {
+        o.expanded = true;
+        o.row = out.raw;
+      }
+    }
+    if (std::string_view(f.name) == "geom_rbound") rbound_ = &out;
     if (out.f32) {
       for (int i = 0; i < num_sims_; ++i) SyncOut(out, i);
     }
@@ -1149,13 +1153,79 @@ class Batch {
     if (!error.empty()) throw std::runtime_error(error);
   }
 
-  static void SetConstFunc(const mjModel* m, mjData* d, int i, void* arg) {
-    auto& ctx = *static_cast<ConstCtx*>(arg);
-    mjModel* mutable_model = const_cast<mjModel*>(m);
-    mj_setConst(mutable_model, d);
-    for (const auto& out : *ctx.outputs) {
-      std::memcpy(static_cast<uint8_t*>(out.raw) + static_cast<size_t>(i) * out.bytes,
-                  out.get(mutable_model), out.bytes);
+  // geom_rbound of the mesh geoms, for the sims about to run: saved before the executor's pass
+  // and put back after it, that pass having overwritten their rows with the template's
+  void CopyBounds(const std::vector<int>& ids, bool save) {
+    bounds_.resize(ids.size() * mesh_geoms_.size());
+    size_t k = 0;
+    for (int i : ids) {
+      mjtNum* row = reinterpret_cast<mjtNum*>(rbound_->raw + i * rbound_->native_row);
+      for (int g : mesh_geoms_) {
+        if (save) {
+          bounds_[k] = row[g];
+        } else {
+          row[g] = bounds_[k];
+        }
+        ++k;
+      }
+    }
+  }
+
+  // the sims that may run: a sleeping one is rejected by CheckSleep when selected
+  std::vector<int> Awake() const {
+    std::vector<int> ids;
+    for (int i = 0; i < num_sims_; ++i) {
+      int flags = template_->opt.enableflags;
+      if (enableflags_) {
+        std::memcpy(&flags, enableflags_->raw + i * enableflags_->native_row, sizeof(flags));
+      }
+      if (!(flags & mjENBL_SLEEP)) ids.push_back(i);
+    }
+    return ids;
+  }
+
+  // mjb_apply task of the pass after the executor's: mj_setConst on a copy of the thread's model
+  // whose written arrays are the thread's own, so that it is left as the executor loaded it
+  static void SetConstApply(const mjModel* m, mjData* d, int i, void* arg) {
+    auto& ctx = *static_cast<SetConstCtx*>(arg);
+    Batch* self = ctx.self;
+    SetConstScratch& s = tls_setconst;
+    if (s.owner != self || s.bytes < self->out_bytes_) {
+      // an exception must not leave this function for the pool's thread; this error is trapped
+      // like a MuJoCo one, and names the simulation
+      try {
+        s.buf.assign(self->out_bytes_, 0);
+      } catch (const std::bad_alloc&) {
+        mju_error("mjbatch: out of memory for set_const");
+      }
+      s.bytes = self->out_bytes_;
+      s.owner = self;
+    }
+    mjModel* work = &s.model;
+    *work = *m;
+    for (const OutField& f : self->out_fields_) {
+      uint8_t* own = s.buf.data() + f.offset;
+      std::memcpy(own, f.info->get(work), f.bytes);
+      f.info->set(work, own);
+    }
+    mj_setConst(work, d);
+    bool changed = false;
+    for (size_t k = 0; k < self->out_fields_.size(); ++k) {
+      const OutField& f = self->out_fields_[k];
+      const uint8_t* value = s.buf.data() + f.offset;
+      if (f.row) {
+        std::memcpy(const_cast<uint8_t*>(f.row) + static_cast<size_t>(i) * f.bytes, value, f.bytes);
+      } else {
+        changed = changed || std::memcmp(value, f.info->get(self->template_), f.bytes);
+      }
+    }
+    if (!changed) return;
+    std::lock_guard<std::mutex> lock(ctx.mu);
+    for (size_t k = 0; k < self->out_fields_.size(); ++k) {
+      const OutField& f = self->out_fields_[k];
+      if (!f.row && std::memcmp(s.buf.data() + f.offset, f.info->get(self->template_), f.bytes)) {
+        ctx.changed[k] = 1;
+      }
     }
   }
 
@@ -1517,5 +1587,10 @@ class Batch {
   std::vector<std::unique_ptr<Slot>> bound_;
   std::vector<std::unique_ptr<Slot>> expanded_;
   const Slot* enableflags_ = nullptr;
+  const Slot* rbound_ = nullptr;  // geom_rbound, once the caller expands it
+  std::vector<int> mesh_geoms_;   // whose bounds mj_setConst leaves to their mesh
+  std::vector<mjtNum> bounds_;    // CopyBounds: theirs, for the sims of the current pass
+  std::vector<OutField> out_fields_;
+  size_t out_bytes_ = 0;
   std::mutex mu_;
 };
