@@ -1458,6 +1458,119 @@ def test_reset_keyframe_and_expanded_qpos0(model):
       batch.reset(keyframe=bad)
 
 
+def test_reset_keeps_pending_state_writes_of_the_selected_sims(model):
+  batch = Batch(model, N, num_threads=3)
+  qpos, state = batch.bind("qpos"), batch.bind("state")
+  batch.bind("ctrl")[:, 0] = 1.0
+  batch.step(nstep=3)
+  before = state.copy()
+  qpos[:, 0] = 0.1 * np.arange(N)  # a write pending on every sim
+  ids = np.array([2, 5, 7])
+  batch.reset(ids)
+  np.testing.assert_array_equal(qpos[ids, 0], 0.1 * ids)
+  np.testing.assert_array_equal(qpos[ids, 1:], np.tile(model.qpos0[1:], (len(ids), 1)))
+  # The others are not touched: their rows still hold their last state and the pending write.
+  others = np.setdiff1d(np.arange(N), ids)
+  np.testing.assert_array_equal(state[others, 2:], before[others, 2:])
+  np.testing.assert_array_equal(state[others, 1], 0.1 * others)
+  # A pending write is applied once: the next reset of those sims restores the default there,
+  # while the write still pending on the others is applied.
+  batch.reset()
+  kept = 0.1 * np.arange(N)
+  kept[ids] = 0.0
+  np.testing.assert_array_equal(qpos[:, 0], kept)
+  np.testing.assert_array_equal(qpos[:, 1:], np.tile(model.qpos0[1:], (N, 1)))
+
+
+def test_reset_without_forward_defers_derived_fields_to_the_next_call(model):
+  batch, ref = Batch(model, N, num_threads=2), Batch(model, N, num_threads=2)
+  ids = np.array([1, 4, 7])
+  for b in (batch, ref):
+    b.bind("ctrl")[:, 0] = 1.0
+    b.step(nstep=5)
+    b.bind("qpos")[ids, 1] = 0.3  # pending writes for the sims about to be reset
+  xpos, ref_xpos = batch.bind("xpos"), ref.bind("xpos")
+  batch.reset(ids, forward=False)
+  ref.reset(ids)
+  np.testing.assert_array_equal(batch.bind("state"), ref.bind("state"))
+  # mj_resetData zeroes the derived fields, and nothing has computed them since.
+  assert not np.any(xpos[ids])
+  batch.forward(ids)
+  np.testing.assert_array_equal(xpos, ref_xpos)
+  batch.reset(keyframe=0, forward=False)
+  np.testing.assert_array_equal(batch.bind("qpos"), np.tile(model.key_qpos[0], (N, 1)))
+  assert not np.any(xpos)
+  batch.forward()
+  ref.reset(keyframe=0)
+  np.testing.assert_array_equal(xpos, ref_xpos)
+
+
+def test_reset_without_forward_then_forward_matches_stock_mujoco(model):
+  batch = Batch(model, N, num_threads=3)
+  ids = np.array([0, 3, 6])
+  qpos, qvel, ctrl, state = (batch.bind(f) for f in ("qpos", "qvel", "ctrl", "state"))
+  qacc, sensordata = batch.bind("qacc"), batch.bind("sensordata")
+  batch.step(nstep=4)
+  qpos[ids, 1] = [0.2, -0.3, 0.4]
+  qvel[ids, 0] = [0.1, -0.2, 0.3]
+  ctrl[:] = np.linspace(-1, 1, N)[:, None]
+  batch.reset(ids, forward=False)
+  batch.forward(ids)
+  expected = np.empty((len(ids), batch.nstate))
+  for k, i in enumerate(ids):
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    data.qpos[1], data.qvel[0], data.ctrl[:] = [0.2, -0.3, 0.4][k], [0.1, -0.2, 0.3][k], ctrl[i]
+    mujoco.mj_forward(model, data)
+    mujoco.mj_getState(model, data, expected[k], mujoco.mjtState.mjSTATE_INTEGRATION)
+    np.testing.assert_array_equal(qacc[i], data.qacc)
+    np.testing.assert_array_equal(sensordata[i], data.sensordata)
+  np.testing.assert_array_equal(state[ids], expected)
+
+
+def test_step_after_reset_without_forward_matches_stock_mujoco(model):
+  # Stepping straight after a reset needs no forward in between, as with mj_resetData and
+  # mj_step.
+  batch, ref = Batch(model, N, num_threads=3), Batch(model, N, num_threads=3)
+  ctrl, state = batch.bind("ctrl"), batch.bind("state")
+  ctrl[:] = np.linspace(-1, 1, N)[:, None]
+  ref.bind("ctrl")[:] = ctrl
+  batch.reset(forward=False)
+  ref.reset()
+  batch.step(nstep=20)
+  ref.step(nstep=20)
+  for i in range(N):
+    data = mujoco.MjData(model)
+    data.ctrl[:] = ctrl[i]
+    for _ in range(20):
+      mujoco.mj_step(model, data)
+    expected = np.empty(batch.nstate)
+    mujoco.mj_getState(model, data, expected, mujoco.mjtState.mjSTATE_INTEGRATION)
+    np.testing.assert_array_equal(state[i], expected)
+  # ... and the same as after a reset that forwarded first.
+  np.testing.assert_array_equal(state, ref.bind("state"))
+
+
+def test_reset_costs_no_memory_in_proportion_to_the_batch():
+  # reset(ids) used to copy every simulation's state to find the pending writes of the selected
+  # rows: 43 MB and ten thousand page faults per call at 16384 simulations of the chain, for
+  # one row as for all of them.
+  resource = pytest.importorskip("resource")
+  num_sims = 16384
+  batch = Batch(mujoco.MjModel.from_xml_string(chain_xml()), num_sims, num_threads=4)
+  batch.bind("qpos")[:, 0] = np.linspace(0.5, 1.5, num_sims)  # a pending write on every row
+  batch.step()
+  samples = []
+  for k in range(6):
+    ids = np.arange(64 * k, 64 * k + 64, dtype=np.int32)
+    before = resource.getrusage(resource.RUSAGE_SELF)
+    batch.reset(ids)
+    after = resource.getrusage(resource.RUSAGE_SELF)
+    if k > 1:
+      samples.append(after.ru_minflt - before.ru_minflt)
+  assert max(samples) < 2000
+
+
 def test_ids_validation_and_time(model):
   batch = Batch(model, N, num_threads=3)
   time = batch.bind("time")

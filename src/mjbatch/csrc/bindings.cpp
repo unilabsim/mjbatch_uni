@@ -63,7 +63,10 @@ after a state write they are stale until the next call, and a write of the
 stale value goes unseen. Every bound field is copied out after a call, and a
 derived field bound between calls is filled for a simulation by its next call.
 reset applies pending writes after mj_resetData and then runs mj_forward, so
-derived fields are valid. After step, sensordata and every derived field are
+derived fields are valid, unless it is called with forward=False: a caller that
+writes state after the reset and runs forward itself skips a forward whose
+results it would overwrite, and derived fields are then zero until
+the simulation's next call. After step, sensordata and every derived field are
 one substep behind qpos and qvel, as with mj_step itself, unless the batch was
 made with forward=True, which ends every step with mj_forward so they are
 current, at the cost of one forward per simulation per call.
@@ -145,7 +148,13 @@ write, and updates no bound field.)")
            "as a flattened sequence of half-open (start, stop) pairs. Semantics match "
            "refresh_sensor_range(); columns outside every requested range are preserved.")
       .def("reset", &Batch::reset, "ids"_a.noconvert() = nb::none(), "keyframe"_a = -1,
-           "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.")
+           nb::kw_only(), "forward"_a = true,
+           "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward unless "
+           "forward is false, which leaves every derived field zero, as mj_resetData leaves it, "
+           "until the simulation's next call. For a caller that writes state after the reset and "
+           "runs "
+           "forward itself: that forward then starts from the warm start of the reset data, as "
+           "after mj_resetData alone, and a forward whose results it would overwrite is skipped.")
       .def("sample_hfield", &Batch::sample_hfield, "geom"_a, "body"_a, "offsets"_a.noconvert(),
            "out"_a.noconvert(), "ids"_a.noconvert() = nb::none(), "alignment"_a = "world",
            "Bilinear hfield sampling per selected simulation at XY offsets around a frame "

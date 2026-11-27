@@ -538,7 +538,9 @@ class Batch {
     RefreshSensorRanges(std::move(ids), *sensor_ranges);
   }
 
-  void reset(std::optional<Ids> ids, int keyframe) {
+  // mj_resetData, or mj_resetDataKeyframe, per selected sim, with what was written to the sim's
+  // state since its last call kept on top, then mj_forward unless the caller runs its own.
+  void reset(std::optional<Ids> ids, int keyframe, bool forward) {
     ReentryGuard();
     if (keyframe < -1 || keyframe >= template_->nkey) {
       throw nb::value_error("keyframe out of range");
@@ -550,7 +552,12 @@ class Batch {
     CheckSleep(selected);
     PrepareExpanded(selected);
 
-    std::vector<mjtNum> before(states_, states_ + written_.size());
+    // What the caller last left in each selected row, which the reset keeps wherever it differs
+    // from what the sim's last call wrote. Only the selection is copied: a call with ids costs
+    // in proportion to their number, not to the size of the batch.
+    std::vector<mjtNum> before;
+    before.reserve(static_cast<size_t>(selected.size()) * nstate_);
+    for (int i : selected) before.insert(before.end(), State(i), State(i) + nstate_);
     std::vector<int> keys;
     const int* key = nullptr;
     if (keyframe >= 0) {
@@ -562,16 +569,18 @@ class Batch {
     std::string error;
     RecordFailures(selected, failed, error);
     auto active = WithoutFailed(selected, failed);
+    size_t position = 0;  // of a sim in selected, which active follows in order
     for (int i : active) {
+      while (selected[position] != i) ++position;
       mjtNum* row = State(i);
       mjtNum* last = Written(i);
-      const mjtNum* old = before.data() + static_cast<size_t>(i) * nstate_;
+      const mjtNum* old = before.data() + position * nstate_;
       for (int k = 0; k < nstate_; ++k) {
         if (std::memcmp(old + k, last + k, sizeof(mjtNum)) != 0) row[k] = old[k];
       }
     }
     Prepare(active);
-    if (!active.empty()) {
+    if (forward && !active.empty()) {
       mjb_forward(batch_, active.data(), static_cast<int>(active.size()), mjSTAGE_ACC);
       RecordFailures(active, failed, error);
     }
