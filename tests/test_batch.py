@@ -1606,6 +1606,165 @@ def test_set_const_matches_a_model_copy_with_the_rows_applied(model):
     assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
 
 
+def test_set_const_with_ids_ignores_an_invalid_sim_outside_the_selection(model):
+  # A call with ids recomputes those sims and nothing else, so one outside the selection
+  # that could not be computed does not fail it; selecting that sim does.
+  batch = Batch(model, N, num_threads=2)
+  pole, puck = model.body("pole").id, model.body("puck").id
+  mass = batch.expand("body_mass")
+  subtree = batch.expand("body_subtreemass")
+  mass[:, pole] = 2.0
+  batch.set_const()
+  mass[3, puck] = 0.0
+  mass[[1, 4], pole] = 3.0
+  batch.set_const(np.array([1, 4]))
+  np.testing.assert_array_equal(subtree[[1, 4], pole], 3.0)
+  with pytest.raises(RuntimeError, match="sim 3"):
+    batch.set_const()
+  mass[3, puck] = 1.0
+  batch.set_const()
+  np.testing.assert_array_equal(subtree[[1, 4], pole], 3.0)
+  np.testing.assert_array_equal(subtree[3, puck], 1.0)
+
+
+KITCHEN_SINK_XML = """
+<mujoco model="sink">
+  <option timestep="0.002" integrator="implicitfast"/>
+  <asset>
+    <hfield name="terrain" nrow="8" ncol="8" size="2 2 0.2 0.02"/>
+    <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .15 .2" width="64" height="64"/>
+    <material name="m" texture="grid" texrepeat="4 4"/>
+  </asset>
+  <worldbody>
+    <light name="lamp" pos="0 0 3" dir="0 0 -1" target="torso" directional="true"/>
+    <camera name="cam" pos="1 1 1" target="torso"/>
+    <geom name="floor" type="hfield" hfield="terrain" material="m"/>
+    <body name="torso" pos="0 0 1" simple="false">
+      <freejoint name="root"/>
+      <geom name="torso_geom" type="box" size=".1 .08 .05" mass="2"/>
+      <site name="top" pos="0 0 .1"/>
+      <site name="s0" pos="0 .2 0"/>
+      <camera name="wrist" pos=".1 0 0" target="tip"/>
+      <light name="headlight" pos="0 0 .2" dir="0 0 -1" target="tip"/>
+      <body name="arm" pos=".1 0 0" simple="false">
+        <joint name="shoulder" type="ball" stiffness="2" damping="0.5" armature="0.01"/>
+        <geom name="arm_geom" type="capsule" fromto="0 0 0 .3 0 0" size=".03" mass="0.5"/>
+        <body name="tip" pos=".3 0 0" simple="false">
+          <joint name="wrist" type="hinge" axis="0 1 0" stiffness="1" springref="0.3" damping="0.2"/>
+          <geom name="tip_geom" type="sphere" size=".04" mass="0.2"/>
+          <site name="s1" pos=".05 0 0"/>
+          <site name="tip_site" pos="0 .05 0"/>
+        </body>
+      </body>
+      <body name="slider" pos="-.1 0 0" simple="false">
+        <joint name="slide" type="slide" axis="0 0 1" stiffness="5" springref="0.05" damping="0.3"/>
+        <geom name="slider_geom" type="cylinder" size=".03 .1" mass="0.3"/>
+        <site name="s2" pos="0 0 .1"/>
+      </body>
+    </body>
+    <body name="mocap" mocap="true" pos="0 1 1" simple="false">
+      <geom type="sphere" size=".02" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="cord" width="0.005" stiffness="3" damping="0.1">
+      <site site="s0"/><site site="s1"/><site site="s2"/>
+    </spatial>
+    <fixed name="rod"><joint joint="wrist" coef="0.5"/><joint joint="slide" coef="1"/></fixed>
+  </tendon>
+  <equality>
+    <weld body1="torso" body2="tip" active="false"/>
+    <connect body1="torso" body2="slider" anchor="0 0 0" active="false"/>
+    <joint joint1="wrist" joint2="slide" polycoef="0 0.5 0 0 0"/>
+  </equality>
+  <actuator>
+    <motor joint="wrist" gear="5"/>
+    <position joint="slide" kp="10"/>
+    <general tendon="rod" dyntype="filter" dynprm="0.02" gainprm="2" biasprm="0 -1 -0.1"/>
+  </actuator>
+  <sensor>
+    <jointpos joint="wrist"/><accelerometer site="tip_site"/><subtreelinvel body="torso"/>
+    <tendonpos tendon="cord"/>
+  </sensor>
+  <keyframe><key qpos="0 0 1 1 0 0 0 1 0 0 0 0.3 0" ctrl="0 0 0"/></keyframe>
+</mujoco>
+"""
+
+
+def test_set_const_matches_a_model_copy_with_springs_tendons_and_constraints():
+  # Springs put qpos_spring to work, tendons and equalities their anchors, cameras and lights
+  # their rest poses, the hfield its size: every group of mj_setConst has something to write.
+  model = mujoco.MjModel.from_xml_string(KITCHEN_SINK_XML)
+  assert model.ntendon and model.neq and model.ncam and model.nlight and model.nhfield
+  batch = Batch(model, N, num_threads=3)
+  rng = np.random.default_rng(0)
+  ids = np.array([0, 2, 3, 7])
+
+  def rows_of(name):
+    return np.broadcast_to(getattr(model, name), (len(ids),) + getattr(model, name).shape)
+
+  def write(name, values):
+    batch.expand(name)[ids] = values
+    names.append(name)
+
+  names = []
+  for name, lo, hi in (
+    ("body_mass", 0.8, 1.2),
+    ("body_inertia", 0.9, 1.1),
+    ("dof_armature", 1.0, 1.5),
+    ("dof_damping", 0.8, 1.2),
+    ("jnt_stiffness", 0.5, 1.5),
+    ("qpos_spring", 0.9, 1.1),
+    ("geom_friction", 0.5, 1.5),
+    ("geom_solref", 0.8, 1.2),
+    ("geom_solimp", 0.8, 0.95),
+    ("tendon_stiffness", 0.5, 1.5),
+    ("tendon_damping", 0.5, 1.5),
+    ("actuator_gear", 0.8, 1.2),
+  ):
+    write(name, rows_of(name) * rng.uniform(lo, hi, (len(ids),) + (1,) * getattr(model, name).ndim))
+  for name in ("body_ipos", "geom_pos", "cam_pos", "light_pos"):
+    write(name, rows_of(name) + rng.uniform(-0.02, 0.02, (len(ids),) + getattr(model, name).shape))
+  timestep = batch.expand("timestep")
+  timestep[ids] = [0.0015, 0.0025, 0.002, 0.003]
+  names.append("timestep")
+  batch.set_const(ids)
+  for i in ids:
+    assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
+  batch.set_const()
+  for i in range(N):
+    assert_writable_fields_match(batch, reference_with_rows(model, batch, names, i), i)
+
+
+FLEX_XML = """
+<mujoco>
+  <option timestep="0.002"/>
+  <worldbody>
+    <flexcomp name="sheet" type="grid" count="3 3 1" spacing=".1 .1 .1" dim="2" radius=".01" mass="1">
+      <elasticity young="1e3" elastic2d="bend" thickness=".01"/>
+    </flexcomp>
+  </worldbody>
+</mujoco>
+"""
+
+
+def test_set_const_follows_an_expanded_timestep_in_the_flex_factor():
+  # The constant metric factor of a flex with bending depends on the timestep. 0.3.0 and
+  # 0.3.1 left it at the template's value, their second pass not having been given the options.
+  model = mujoco.MjModel.from_xml_string(FLEX_XML)
+  assert model.nefm0dof > 0 and model.efm0_L.size
+  batch = Batch(model, 4, num_threads=2)
+  ids = np.array([0, 2])
+  batch.expand("timestep")[ids] = 0.003
+  batch.set_const(ids)
+  ref = copy.copy(model)
+  ref.opt.timestep = 0.003
+  mujoco.mj_setConst(ref, mujoco.MjData(ref))
+  assert not np.array_equal(ref.efm0_L, model.efm0_L)
+  np.testing.assert_array_equal(batch.expand("efm0_L")[ids], np.tile(ref.efm0_L, (2, 1)))
+  np.testing.assert_array_equal(batch.expand("efm0_L")[[1, 3]], np.tile(model.efm0_L, (2, 1)))
+
+
 MESH_BODY_XML = """
 <mujoco>
   <option timestep="0.002"/>
